@@ -77,29 +77,70 @@ def parse_xliff(file_content):
 
 def parse_wol_html(file_content, is_version1):
     segments = []
+    # Use 'lxml' if available, but 'html.parser' is standard in stlite
     soup = BeautifulSoup(file_content, 'html.parser')
     tables = soup.find_all("table")
-    if len(tables) < 2:
-        raise ValueError("WOL report structure not recognized (missing tables).")
-        
-    header = tables[1].find("tr")
-    headers = [td.get_text(strip=True).lower() for td in header.find_all("td")]
     
-    try:
-        source_idx = headers.index("source")
-        pe_idx = headers.index("pe translation")
-        re_idx = headers.index("re translation")
-    except ValueError:
-        st.error("Could not find required columns (Source, PE Translation, RE Translation)")
+    target_table = None
+    headers = []
+    
+    # 1. SMART TABLE DETECTION
+    # Loop through all tables to find the one containing the correct headers
+    for table in tables:
+        # Get the first row (header row)
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+            
+        # Extract text from all cells (th or td) in the first row
+        # We use separator=" " to ensure "PE" and "Translation" don't get stuck together
+        cells = rows[0].find_all(['th', 'td'])
+        current_headers = [c.get_text(" ", strip=True).lower() for c in cells]
+        
+        # Check if this looks like the data table (must have "source" and "re translation")
+        if "source" in current_headers and "re translation" in current_headers:
+            target_table = table
+            headers = current_headers
+            break
+            
+    if target_table is None:
+        st.error("Could not find the Data Table in the uploaded WOL Report. Please check the file format.")
         return []
 
-    for row in tables[1].find_all("tr")[1:]:
+    # 2. FLEXIBLE COLUMN INDEXING
+    try:
+        source_idx = headers.index("source")
+        re_idx = headers.index("re translation")
+        
+        # Look for the Version 1 column (PE, HT, or just Translation)
+        pe_idx = -1
+        possible_v1_headers = ["pe translation", "ht translation", "mt translation", "translation"]
+        
+        for h in possible_v1_headers:
+            if h in headers:
+                pe_idx = headers.index(h)
+                break
+        
+        if pe_idx == -1:
+             st.error("Could not find 'PE Translation' or 'HT Translation' column.")
+             return []
+
+    except ValueError:
+        st.error("Error identifying column indexes.")
+        return []
+
+    # 3. EXTRACT DATA
+    # Skip the header row ([1:])
+    for row in target_table.find_all("tr")[1:]:
         cells = row.find_all("td")
+        # Ensure the row has enough cells
         if len(cells) > max(source_idx, pe_idx, re_idx):
-            source = html.unescape(cells[source_idx].get_text(strip=True))
-            v1 = html.unescape(cells[pe_idx].get_text(strip=True))
-            v2 = html.unescape(cells[re_idx].get_text(strip=True))
+            source = html.unescape(cells[source_idx].get_text(" ", strip=True))
+            v1 = html.unescape(cells[pe_idx].get_text(" ", strip=True))
+            v2 = html.unescape(cells[re_idx].get_text(" ", strip=True))
+            
             segments.append({"source": source, "target": v1 if is_version1 else v2})
+            
     return segments
 
 def load_segments(uploaded_file, is_version1=True):
