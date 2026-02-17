@@ -9,6 +9,7 @@ from difflib import ndiff, SequenceMatcher
 from collections import Counter
 import io
 import os
+import zipfile  # <--- NEW IMPORT FOR ZIP FUNCTIONALITY
 
 # ==========================================
 # PART 1: CORE PARSING LOGIC
@@ -358,6 +359,9 @@ v2_file = None
 
 # 1. BILINGUAL FILES MODE
 if mode == "Bilingual Files (TMX/XLIFF)":
+    # Clear excel state if switching modes
+    if 'excel_results' in st.session_state: del st.session_state['excel_results']
+    
     col1, col2 = st.columns(2)
     v1_file = col1.file_uploader("Upload Original Version", type=["tmx", "mxliff", "sdlxliff"])
     v2_file = col2.file_uploader("Upload Updated Version", type=["tmx", "mxliff", "sdlxliff"])
@@ -376,7 +380,6 @@ if mode == "Bilingual Files (TMX/XLIFF)":
                     st.success("Comparison Complete!")
                     st.download_button(label=f"⬇️ DOWNLOAD REPORT ({out_filename})", data=report_html, file_name=out_filename, mime="text/html")
                     
-                    # Dashboard (Standard single file logic)
                     st.divider()
                     st.subheader("📊 Translation Analytics")
                     m1, m2, m3, m4 = st.columns(4)
@@ -385,21 +388,21 @@ if mode == "Bilingual Files (TMX/XLIFF)":
                     m3.metric("Expansion Factor", f"{stats['expansion']:+.1f}%", help="Length difference.")
                     m4.metric("Avg Edit Similarity", f"{stats['avg_score']:.1f}%", help="Levenshtein score.")
                     st.divider()
-                    # (Preview logic omitted for brevity in multi-file context, but present in full file)
+                    
                 except Exception as e:
                     st.error(f"Error: {e}")
 
-# 2. EXCEL MULTI-FILE MODE
+# 2. EXCEL MULTI-FILE MODE (FIXED WITH SESSION STATE)
 elif mode == "Excel (3 Columns)":
-    # Changed to accept_multiple_files=True
     v1_files = st.file_uploader("Upload Excel Files", type=["xlsx"], accept_multiple_files=True)
     st.info("Excel must have Source in Col A, Original in Col B, Updated in Col C.")
 
+    # A. PROCESSING BUTTON
     if st.button("Compare & Generate Reports"):
         if not v1_files:
             st.warning("Please upload at least one Excel file.")
         else:
-            # Iterate through each uploaded file
+            results_storage = []
             for excel_file in v1_files:
                 with st.spinner(f"Processing {excel_file.name}..."):
                     try:
@@ -407,25 +410,61 @@ elif mode == "Excel (3 Columns)":
                         report_html, stats = generate_html_report(v1_segs, v2_segs, filter_map[filter_opt])
                         out_filename = generate_output_filename(mode, excel_file)
                         
-                        st.success(f"Processed: {excel_file.name}")
-                        st.download_button(
-                            label=f"⬇️ DOWNLOAD REPORT ({out_filename})",
-                            data=report_html,
-                            file_name=out_filename,
-                            mime="text/html",
-                            key=out_filename # Unique key required for buttons in loops
-                        )
-                        with st.expander(f"View Stats for {excel_file.name}"):
-                            c1, c2, c3 = st.columns(3)
-                            c1.metric("Total", stats["total"])
-                            c2.metric("Changed", f"{stats['changed']} ({stats['pct']:.1f}%)")
-                            c3.metric("Similarity", f"{stats['avg_score']:.1f}%")
-                            
+                        results_storage.append({
+                            "filename": out_filename,
+                            "original_name": excel_file.name,
+                            "html": report_html,
+                            "stats": stats
+                        })
                     except Exception as e:
                         st.error(f"Error processing {excel_file.name}: {e}")
+            
+            # Store results in Session State to survive reruns
+            st.session_state['excel_results'] = results_storage
+
+    # B. RENDER RESULTS (FROM SESSION STATE)
+    if 'excel_results' in st.session_state and st.session_state['excel_results']:
+        st.success(f"Processed {len(st.session_state['excel_results'])} files.")
+        
+        # --- ZIP DOWNLOAD (DOWNLOAD ALL) ---
+        if len(st.session_state['excel_results']) > 1:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for res in st.session_state['excel_results']:
+                    zf.writestr(res['filename'], res['html'])
+            
+            st.download_button(
+                label="📦 DOWNLOAD ALL REPORTS (.ZIP)",
+                data=zip_buffer.getvalue(),
+                file_name="BilingualDiff_All_Reports.zip",
+                mime="application/zip",
+                key="download_all_zip"
+            )
+            st.divider()
+
+        # --- INDIVIDUAL DOWNLOADS ---
+        for i, res in enumerate(st.session_state['excel_results']):
+            col_a, col_b = st.columns([3, 1])
+            with col_a:
+                st.write(f"**{res['original_name']}**")
+            with col_b:
+                with st.expander("Stats"):
+                     st.write(f"Changed: {res['stats']['changed']} ({res['stats']['pct']:.1f}%)")
+
+            st.download_button(
+                label=f"⬇️ DOWNLOAD REPORT ({res['filename']})",
+                data=res['html'],
+                file_name=res['filename'],
+                mime="text/html",
+                key=f"dl_btn_{i}" # Unique key is crucial
+            )
+            st.markdown("---")
 
 # 3. WOL REPORT MODE
 elif mode == "WOL Report":
+    # Clear excel state if switching modes
+    if 'excel_results' in st.session_state: del st.session_state['excel_results']
+
     v1_file = st.file_uploader("Upload WOL HTML Report", type=["html", "htm"])
     if st.button("Compare & Generate Report"):
         if not v1_file:
