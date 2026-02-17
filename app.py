@@ -7,12 +7,11 @@ import re
 from difflib import ndiff
 from collections import Counter
 import io
+import os
 
 # ==========================================
-# PART 1: CORE PARSING LOGIC (Unchanged)
+# PART 1: CORE PARSING LOGIC
 # ==========================================
-# (Keep your existing parse_tmx, parse_excel, parse_xliff, parse_wol_html, load_segments here)
-# ... [Paste previous parsing code here if re-copying, otherwise just keep it] ...
 
 def parse_tmx(file_content):
     segments = []
@@ -27,18 +26,11 @@ def parse_tmx(file_content):
             seg = tuv.find("seg")
             if seg is not None:
                 text = seg.text or ""
-                # Improved: Default to first TUV if "en" not found, or use explicit EN check
                 if "en" in lang: 
                     seg_pair["source"] = text
                 else:
                     seg_pair["target"] = text
         
-        # Fallback: If we missed one, assume order (standard TMX is often Source -> Target)
-        # (This is a simplified patch, a full fix would require a UI selector)
-        if not seg_pair["source"] and seg_pair["target"]:
-             # Swap if only target was populated (logic edge case)
-             pass 
-
         if seg_pair["source"] and seg_pair["target"]:
             segments.append(seg_pair)
     return segments
@@ -122,22 +114,19 @@ def load_segments(uploaded_file, is_version1=True):
     else: return []
 
 # ==========================================
-# PART 2: EXPORT & COMPARE LOGIC (Enhanced)
+# PART 2: EXPORT & COMPARE LOGIC
 # ==========================================
 
 def get_valid_words(text):
-    """Extracts words for stats based on user criteria."""
-    # Split by non-word characters
     words = re.findall(r'\b\w+\b', text.lower())
     valid = []
     for w in words:
         if w.isdigit():
-            valid.append(w) # No length limit for numbers
+            valid.append(w)
         elif w.isalpha():
-            if len(w) >= 3: # Minimum 3 chars for letters
+            if len(w) >= 3:
                 valid.append(w)
         else:
-             # Mixed alphanumeric (e.g., 'v2', 'item1') -> Include them
              valid.append(w)
     return valid
 
@@ -160,7 +149,6 @@ def highlight_differences(v1, v2):
 def generate_html_report(v1_segs, v2_segs, filter_option):
     filtered = []
     
-    # Stats Counters
     total_strings = len(v1_segs)
     changed_strings = 0
     removed_words_counter = Counter()
@@ -176,18 +164,14 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
             status = "Different"
             changed_strings += 1
             
-            # --- Stats Logic ---
             w1 = Counter(get_valid_words(v1))
             w2 = Counter(get_valid_words(v2))
             
-            # Words in V1 but not V2 (Removed)
             removed = (w1 - w2).elements()
             removed_words_counter.update(removed)
             
-            # Words in V2 but not V1 (Added)
             added = (w2 - w1).elements()
             added_words_counter.update(added)
-            # -------------------
 
         if filter_option == "diff" and status == "Same": continue
         if filter_option == "same" and status == "Different": continue
@@ -195,7 +179,6 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
         v1_hl, v2_hl = highlight_differences(v1, v2)
         filtered.append((i, source, v1_hl, v2_hl, status))
 
-    # Calculate Summaries
     change_pct = (changed_strings / total_strings * 100) if total_strings > 0 else 0
     
     most_removed = removed_words_counter.most_common(1)
@@ -204,7 +187,6 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
     most_added = added_words_counter.most_common(1)
     most_added_str = f"{most_added[0][0]} ({most_added[0][1]}x)" if most_added else "None"
 
-    # Create HTML String
     html_out = f"""
     <html><head><meta charset="UTF-8"><title>BilingualDiff Report</title>
     <style>
@@ -236,7 +218,6 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
     
     html_out += "</table></body></html>"
     
-    # Return stats for UI usage
     stats = {
         "total": total_strings,
         "changed": changed_strings,
@@ -246,6 +227,31 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
     }
     
     return html_out, stats
+
+def generate_output_filename(mode, v1_file, v2_file=None):
+    """Generates a smart filename based on the mode and input files."""
+    if mode == "Bilingual Files (TMX/XLIFF)" and v1_file and v2_file:
+        name1 = v1_file.name
+        name2 = v2_file.name
+        
+        # 1. Try to find language code in filename (e.g., de-de, fr_FR, de_DE)
+        # Regex looks for 2 letters + separator + 2 letters
+        lang_match = re.search(r'([a-z]{2}[-_][a-z]{2})', name1, re.IGNORECASE)
+        lang_code = lang_match.group(1).lower() if lang_match else "unknown"
+        
+        # 2. Get first 15 chars (clean)
+        part1 = name1[:15]
+        part2 = name2[:15]
+        
+        # 3. Construct name
+        return f"{lang_code}_{part1}_vs_{part2}.html"
+        
+    elif mode in ["Excel (3 Columns)", "WOL Report"] and v1_file:
+        # Use input file name, strip extension, add suffix
+        base_name = os.path.splitext(v1_file.name)[0]
+        return f"{base_name}_Report.html"
+        
+    return "BilingualDiff_Report.html"
 
 # ==========================================
 # PART 3: STREAMLIT UI
@@ -283,7 +289,7 @@ if st.button("Compare & Generate Report"):
     else:
         with st.spinner("Processing in browser..."):
             try:
-                # [Data Loading Logic - Same as before]
+                # [Data Loading]
                 if mode == "Excel (3 Columns)":
                     v1_segs, v2_segs = parse_excel(v1_file)
                 elif mode == "WOL Report":
@@ -299,7 +305,7 @@ if st.button("Compare & Generate Report"):
                 # [Generate Report & Stats]
                 report_html, stats = generate_html_report(v1_segs, v2_segs, filter_map[filter_opt])
                 
-                # [Display Stats on Dashboard]
+                # [Display Stats]
                 st.divider()
                 st.subheader("📊 Analysis")
                 m1, m2, m3, m4 = st.columns(4)
@@ -311,7 +317,7 @@ if st.button("Compare & Generate Report"):
 
                 st.success("Comparison Complete!")
                 
-                # Preview
+                # [Preview]
                 st.subheader("Preview (First 5 Differences)")
                 count = 0
                 for s1, s2 in zip(v1_segs, v2_segs):
@@ -323,10 +329,13 @@ if st.button("Compare & Generate Report"):
                         count += 1
                         if count >= 5: break
                 
+                # [Smart Filename Generation]
+                out_filename = generate_output_filename(mode, v1_file, v2_file)
+                
                 st.download_button(
-                    label="Download Full HTML Report",
+                    label=f"Download Report ({out_filename})",
                     data=report_html,
-                    file_name="BilingualDiff_Report.html",
+                    file_name=out_filename,
                     mime="text/html"
                 )
 
