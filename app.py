@@ -20,30 +20,49 @@ def parse_tmx(file_content):
     root = tree.getroot()
     ns = {'xml': 'http://www.w3.org/XML/1998/namespace'}
     
+    # 1. Try to detect source language from the header
+    header = root.find("header")
+    src_lang = "en" # Default fallback
+    if header is not None:
+        src_lang = header.attrib.get("srclang", "en").lower()
+
     for tu in root.iter("tu"):
-        seg_pair = {"source": "", "target": ""}
-        for tuv in tu.findall("tuv"):
+        source_text = ""
+        target_text = ""
+        
+        tuvs = tu.findall("tuv")
+        if len(tuvs) < 2: continue # Skip if not a pair
+
+        # Strategy 1: Use TMX 'srclang' to identify source
+        for tuv in tuvs:
             lang = tuv.attrib.get(f"{{{ns['xml']}}}lang", "").lower()
             seg = tuv.find("seg")
-            if seg is not None:
-                text = seg.text or ""
-                # Heuristic: if "en" is in lang code, treat as source.
-                # If no "en" is found, the first one will be source, second target based on loop.
-                if "en" in lang: 
-                    seg_pair["source"] = text
-                else:
-                    seg_pair["target"] = text
-        
-        # Fallback if specific language logic failed but we have two segments
-        if not seg_pair["source"] and seg_pair["target"]:
-             pass 
+            text = seg.text if seg is not None else ""
+            
+            if not text: continue
 
-        if seg_pair["source"] and seg_pair["target"]:
-            segments.append(seg_pair)
+            # If this TUV matches the header source language, it's Source.
+            # Otherwise, it's Target.
+            # We use 'in' because sometimes codes are 'en-US' vs 'en'
+            if src_lang in lang:
+                source_text = text
+            else:
+                target_text = text
+        
+        # Strategy 2: Fallback (First TUV is Source, Second is Target)
+        if not source_text or not target_text:
+             # Reset and force order
+             seg1 = tuvs[0].find("seg")
+             seg2 = tuvs[1].find("seg")
+             source_text = seg1.text if seg1 is not None else ""
+             target_text = seg2.text if seg2 is not None else ""
+
+        if source_text and target_text:
+            segments.append({"source": source_text, "target": target_text})
+            
     return segments
 
 def parse_excel(file_content):
-    # Engine 'openpyxl' is required for xlsx in Pyodide
     df = pd.read_excel(file_content, engine="openpyxl", header=None)
     v1, v2 = [], []
     for _, row in df.iterrows():
@@ -61,11 +80,9 @@ def parse_xliff(file_content):
     try:
         tree = ET.parse(file_content)
         root = tree.getroot()
-        # Detect namespace
         ns_match = re.match(r'\{(.*)\}', root.tag)
         ns = {'ns': ns_match.group(1)} if ns_match else {}
         
-        # Handle both mxliff and sdlxliff logic
         units = root.findall('.//ns:trans-unit', ns) if ns else root.findall('.//trans-unit')
         
         for trans_unit in units:
@@ -81,7 +98,7 @@ def parse_xliff(file_content):
         st.error(f"Error parsing XLIFF: {e}")
     return segments
 
-def parse_wol_html(file_content, is_version1):
+def parse_wol_html(file_content, is_original):
     segments = []
     soup = BeautifulSoup(file_content, 'html.parser')
     tables = soup.find_all("table")
@@ -89,7 +106,6 @@ def parse_wol_html(file_content, is_version1):
     target_table = None
     headers = []
     
-    # Smart Table Detection
     for table in tables:
         rows = table.find_all("tr")
         if not rows: continue
@@ -108,7 +124,6 @@ def parse_wol_html(file_content, is_version1):
         re_idx = headers.index("re translation")
         pe_idx = -1
         
-        # Flexible column indexing for PE/Translation
         for h in ["pe translation", "ht translation", "mt translation", "translation"]:
             if h in headers:
                 pe_idx = headers.index(h)
@@ -125,20 +140,20 @@ def parse_wol_html(file_content, is_version1):
             v1 = html.unescape(cells[pe_idx].get_text(" ", strip=True))
             v2 = html.unescape(cells[re_idx].get_text(" ", strip=True))
             
-            segments.append({"source": source, "target": v1 if is_version1 else v2})
+            segments.append({"source": source, "target": v1 if is_original else v2})
             
     return segments
 
-def load_segments(uploaded_file, is_version1=True):
+def load_segments(uploaded_file, is_original=True):
     uploaded_file.seek(0)
     filename = uploaded_file.name.lower()
     
     if filename.endswith(".tmx"):
         return parse_tmx(uploaded_file)
     elif filename.endswith(".xlsx"):
-        return parse_excel(uploaded_file)[0] if is_version1 else parse_excel(uploaded_file)[1]
+        return parse_excel(uploaded_file)[0] if is_original else parse_excel(uploaded_file)[1]
     elif filename.endswith(".htm") or filename.endswith(".html"):
-        return parse_wol_html(uploaded_file, is_version1)
+        return parse_wol_html(uploaded_file, is_original)
     elif filename.endswith(".mxliff") or filename.endswith(".sdlxliff"):
         return parse_xliff(uploaded_file)
     else:
@@ -149,7 +164,6 @@ def load_segments(uploaded_file, is_version1=True):
 # ==========================================
 
 def get_valid_words(text):
-    """Extracts words for stats: numbers or words > 2 chars."""
     words = re.findall(r'\b\w+\b', text.lower())
     valid = []
     for w in words:
@@ -179,38 +193,28 @@ def highlight_differences(v1, v2):
     return highlighted_v1, highlighted_v2
 
 def generate_output_filename(mode, v1_file, v2_file=None):
-    """Smart filename generation based on inputs."""
     if mode == "Bilingual Files (TMX/XLIFF)" and v1_file and v2_file:
         name1 = v1_file.name
         name2 = v2_file.name
-        
-        # Regex looks for 2 letters + separator + 2 letters (e.g. de-de, fr_FR)
         lang_match = re.search(r'([a-z]{2}[-_][a-z]{2})', name1, re.IGNORECASE)
         lang_code = lang_match.group(1).lower() if lang_match else "unknown"
-        
-        # Take first 15 chars
         part1 = name1[:15]
         part2 = name2[:15]
-        
         return f"{lang_code}_{part1}_vs_{part2}.html"
-        
     elif mode in ["Excel (3 Columns)", "WOL Report"] and v1_file:
         base_name = os.path.splitext(v1_file.name)[0]
         return f"{base_name}_Report.html"
-        
     return "BilingualDiff_Report.html"
 
 def generate_html_report(v1_segs, v2_segs, filter_option):
     filtered = []
     
-    # Stats Counters
     total_strings = len(v1_segs)
     changed_strings = 0
     removed_words_counter = Counter()
     added_words_counter = Counter()
     
-    # Advanced Stats
-    edit_distances = [] # Store 0-100 scores
+    edit_distances = [] 
     total_len_v1 = 0
     total_len_v2 = 0
     
@@ -229,12 +233,10 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
             status = "Different"
             changed_strings += 1
             
-            # 1. Similarity Score
             matcher = SequenceMatcher(None, v1, v2)
             score = round(matcher.ratio() * 100, 1)
             edit_distances.append(score)
             
-            # 2. Word Counts
             w1 = Counter(get_valid_words(v1))
             w2 = Counter(get_valid_words(v2))
             
@@ -244,7 +246,7 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
             added = (w2 - w1).elements()
             added_words_counter.update(added)
         else:
-             edit_distances.append(100) # Perfect match
+             edit_distances.append(100)
 
         if filter_option == "diff" and status == "Same": continue
         if filter_option == "same" and status == "Different": continue
@@ -252,30 +254,23 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
         v1_hl, v2_hl = highlight_differences(v1, v2)
         filtered.append((i, source, v1_hl, v2_hl, status, score))
 
-    # --- Summary Calculations ---
     change_pct = (changed_strings / total_strings * 100) if total_strings > 0 else 0
-    
     top5_removed = removed_words_counter.most_common(5)
     top5_added = added_words_counter.most_common(5)
-
     expansion = ((total_len_v2 - total_len_v1) / total_len_v1 * 100) if total_len_v1 > 0 else 0
     
-    # Average Edit Distance (only on changed strings)
     changed_scores = [s for s in edit_distances if s < 100]
     avg_edit_score = sum(changed_scores) / len(changed_scores) if changed_scores else 100
 
-    # Categorize edits for Graph
     edit_categories = {"Minor Edit (>85%)": 0, "Medium Edit (50-85%)": 0, "Major Rewrite (<50%)": 0}
     for s in changed_scores:
         if s > 85: edit_categories["Minor Edit (>85%)"] += 1
         elif s >= 50: edit_categories["Medium Edit (50-85%)"] += 1
         else: edit_categories["Major Rewrite (<50%)"] += 1
 
-    # Helper for HTML list
     def list_to_html(lst):
         return ", ".join([f"{w} ({c})" for w, c in lst]) if lst else "None"
 
-    # Create HTML String
     html_out = f"""
     <html><head><meta charset="UTF-8"><title>BilingualDiff Report</title>
     <style>
@@ -303,7 +298,7 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
     <b>Top Added:</b> {list_to_html(top5_added)}</p>
 
     <table>
-    <tr><th>ID</th><th>Source</th><th>Version 1</th><th>Version 2</th><th>Match %</th></tr>
+    <tr><th>ID</th><th>Source</th><th>Original Version</th><th>Updated Version</th><th>Match %</th></tr>
     """
     
     for seg_id, src, v1, v2, status, score in filtered:
@@ -331,6 +326,28 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
 
 st.set_page_config(page_title="BilingualDiff", layout="wide")
 
+# Corrected CSS for Green Download Button
+st.markdown("""
+    <style>
+    div[data-testid="stDownloadButton"] button {
+        background-color: #2e7d32 !important;
+        color: white !important;
+        font-weight: bold !important;
+        font-size: 18px !important;
+        padding: 10px 24px !important;
+        border: none !important;
+        border-radius: 8px !important;
+        width: 100%;
+        margin-top: 20px !important;
+    }
+    div[data-testid="stDownloadButton"] button:hover {
+        background-color: #1b5e20 !important;
+        color: white !important;
+        border: none !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 st.title("🌍 BilingualDiff (Secure Web Edition)")
 st.markdown("Compare translation versions securely. **Files never leave your browser.**")
 
@@ -343,88 +360,78 @@ with st.sidebar:
 v1_file = None
 v2_file = None
 
-# UI Logic for File Uploads
 if mode == "Bilingual Files (TMX/XLIFF)":
     col1, col2 = st.columns(2)
-    v1_file = col1.file_uploader("Upload Version 1", type=["tmx", "mxliff", "sdlxliff"])
-    v2_file = col2.file_uploader("Upload Version 2", type=["tmx", "mxliff", "sdlxliff"])
+    v1_file = col1.file_uploader("Upload Original Version", type=["tmx", "mxliff", "sdlxliff"])
+    v2_file = col2.file_uploader("Upload Updated Version", type=["tmx", "mxliff", "sdlxliff"])
 
 elif mode == "Excel (3 Columns)":
     v1_file = st.file_uploader("Upload Excel File", type=["xlsx"])
-    st.info("Excel must have Source in Col A, Version 1 in Col B, Version 2 in Col C.")
+    st.info("Excel must have Source in Col A, Original in Col B, Updated in Col C.")
 
 elif mode == "WOL Report":
     v1_file = st.file_uploader("Upload WOL HTML Report", type=["html", "htm"])
 
-# Processing Logic
 if st.button("Compare & Generate Report"):
     if not v1_file:
         st.warning("Please upload the required files.")
     else:
         with st.spinner("Processing in browser..."):
             try:
-                # 1. Load Data
                 if mode == "Excel (3 Columns)":
                     v1_segs, v2_segs = parse_excel(v1_file)
                 elif mode == "WOL Report":
                     v1_segs = load_segments(v1_file, True)
                     v2_segs = load_segments(v1_file, False)
-                else: # TMX/XLIFF
+                else: 
                     if not v2_file:
-                        st.error("Version 2 file is missing!")
+                        st.error("Updated Version file is missing!")
                         st.stop()
                     v1_segs = load_segments(v1_file, True)
                     v2_segs = load_segments(v2_file, False)
                 
-                # 2. Generate Report & Statistics
                 report_html, stats = generate_html_report(v1_segs, v2_segs, filter_map[filter_opt])
                 
-                # 3. SUCCESS MESSAGE
                 st.success("Comparison Complete!")
                 
-                # 4. DOWNLOAD BUTTON (Top Priority)
                 out_filename = generate_output_filename(mode, v1_file, v2_file)
+                
+                # Big Green Download Button
                 st.download_button(
-                    label=f"Download Report ({out_filename})",
+                    label=f"⬇️ DOWNLOAD REPORT ({out_filename})",
                     data=report_html,
                     file_name=out_filename,
                     mime="text/html"
                 )
                 
-                # 5. ANALYTICS DASHBOARD
                 st.divider()
                 st.subheader("📊 Translation Analytics")
                 
-                # Row 1: High Level Metrics
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Total Strings", stats["total"])
-                m2.metric("Changed Strings", f"{stats['changed']} ({stats['pct']:.1f}%)")
-                m3.metric("Expansion Factor", f"{stats['expansion']:+.1f}%", help="Positive means V2 is longer than V1")
-                m4.metric("Avg Edit Similarity", f"{stats['avg_score']:.1f}%", help="Lower score = heavier edits")
+                m1.metric("Total Strings", stats["total"], help="Total count of segments found in the files.")
+                m2.metric("Changed Strings", f"{stats['changed']} ({stats['pct']:.1f}%)", help="Number of segments where text differs between versions.")
+                m3.metric("Expansion Factor", f"{stats['expansion']:+.1f}%", help="Length difference (Positive = Updated is longer).")
+                m4.metric("Avg Edit Similarity", f"{stats['avg_score']:.1f}%", help="Levenshtein score (100% = Identical, 0% = Total Rewrite).")
                 
                 st.divider()
                 
-                # Row 2: Graph & Word Lists
                 c1, c2 = st.columns([2, 1])
                 
                 with c1:
                     st.markdown("#### Edit Intensity Distribution")
-                    st.caption("How heavy were the changes?")
+                    st.caption("Categorizes changes by how much the text was altered (Minor vs Major).")
                     
-                    # --- MATPLOTLIB FIX FOR BROWSER ---
                     categories = list(stats["graph_data"].keys())
                     counts = list(stats["graph_data"].values())
                     
                     if sum(counts) > 0:
                         fig, ax = plt.subplots(figsize=(5, 3))
                         bars = ax.bar(categories, counts, color=['#4caf50', '#ff9800', '#f44336'])
-                        
                         ax.spines['top'].set_visible(False)
                         ax.spines['right'].set_visible(False)
                         ax.set_ylabel("Count")
                         plt.xticks(rotation=15, ha='right')
                         
-                        # Add counts on top of bars
                         for bar in bars:
                             height = bar.get_height()
                             ax.annotate(f'{height}',
@@ -439,12 +446,14 @@ if st.button("Compare & Generate Report"):
 
                 with c2:
                     st.markdown("#### Most Removed Words")
+                    st.caption("Words frequently found in Original but gone in Updated.")
                     if stats['top_removed']:
                         for w, c in stats['top_removed']:
                             st.markdown(f"- **{w}**: {c}x")
                     else: st.markdown("_None_")
 
                     st.markdown("#### Most Added Words")
+                    st.caption("Words frequently found in Updated but not in Original.")
                     if stats['top_added']:
                         for w, c in stats['top_added']:
                             st.markdown(f"- **{w}**: {c}x")
@@ -452,15 +461,14 @@ if st.button("Compare & Generate Report"):
                 
                 st.divider()
                 
-                # 6. PREVIEW (Bottom)
                 st.subheader("Preview (First 5 Differences)")
                 count = 0
                 preview_shown = False
                 for s1, s2 in zip(v1_segs, v2_segs):
                     if s1['target'] != s2['target']:
                         st.text(f"Source: {s1['source'][:50]}...")
-                        st.markdown(f"**V1:** {s1['target']}")
-                        st.markdown(f"**V2:** {s2['target']}")
+                        st.markdown(f"**Original:** {s1['target']}")
+                        st.markdown(f"**Updated:** {s2['target']}")
                         st.divider()
                         count += 1
                         preview_shown = True
