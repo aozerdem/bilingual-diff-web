@@ -109,7 +109,7 @@ def load_segments(uploaded_file, is_version1=True):
     else: return []
 
 # ==========================================
-# PART 2: EXPORT & COMPARE LOGIC (Enhanced)
+# PART 2: EXPORT & COMPARE LOGIC (Unchanged)
 # ==========================================
 
 def get_valid_words(text):
@@ -181,7 +181,7 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
             status = "Different"
             changed_strings += 1
             
-            # 1. Similarity Score (0 = completely different, 100 = identical)
+            # 1. Similarity Score
             matcher = SequenceMatcher(None, v1, v2)
             score = round(matcher.ratio() * 100, 1)
             edit_distances.append(score)
@@ -212,7 +212,7 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
     # Expansion Factor
     expansion = ((total_len_v2 - total_len_v1) / total_len_v1 * 100) if total_len_v1 > 0 else 0
     
-    # Average Edit Distance (on changed strings only to be meaningful)
+    # Average Edit Distance
     changed_scores = [s for s in edit_distances if s < 100]
     avg_edit_score = sum(changed_scores) / len(changed_scores) if changed_scores else 100
 
@@ -224,7 +224,6 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
         else: edit_categories["Major Rewrite (<50%)"] += 1
 
     # --- HTML Generation ---
-    # Convert Top 5 to HTML string for the report
     def list_to_html(lst):
         return ", ".join([f"{w} ({c})" for w, c in lst]) if lst else "None"
 
@@ -327,6 +326,17 @@ if st.button("Compare & Generate Report"):
                 # [Generate Report & Stats]
                 report_html, stats = generate_html_report(v1_segs, v2_segs, filter_map[filter_opt])
                 
+                # [Success & Download Button MOVED HERE]
+                st.success("Comparison Complete!")
+                
+                out_filename = generate_output_filename(mode, v1_file, v2_file)
+                st.download_button(
+                    label=f"Download Report ({out_filename})",
+                    data=report_html,
+                    file_name=out_filename,
+                    mime="text/html"
+                )
+                
                 # [Display Analytics Dashboard]
                 st.divider()
                 st.subheader("📊 Translation Analytics")
@@ -367,8 +377,6 @@ if st.button("Compare & Generate Report"):
                     else: st.markdown("_None_")
                 
                 st.divider()
-
-                st.success("Comparison Complete!")
                 
                 # [Preview]
                 st.subheader("Preview (First 5 Differences)")
@@ -381,15 +389,6 @@ if st.button("Compare & Generate Report"):
                         st.divider()
                         count += 1
                         if count >= 5: break
-                
-                # [Download]
-                out_filename = generate_output_filename(mode, v1_file, v2_file)
-                st.download_button(
-                    label=f"Download Report ({out_filename})",
-                    data=report_html,
-                    file_name=out_filename,
-                    mime="text/html"
-                )
 
             except Exception as e:
                 st.error(f"An error occurred: {str(e)}")
