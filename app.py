@@ -9,7 +9,7 @@ from difflib import ndiff, SequenceMatcher
 from collections import Counter
 import io
 import os
-import zipfile  # <--- NEW IMPORT FOR ZIP FUNCTIONALITY
+import zipfile
 
 # ==========================================
 # PART 1: CORE PARSING LOGIC
@@ -21,9 +21,8 @@ def parse_tmx(file_content):
     root = tree.getroot()
     ns = {'xml': 'http://www.w3.org/XML/1998/namespace'}
     
-    # 1. Try to detect source language from the header
     header = root.find("header")
-    src_lang = "en" # Default fallback
+    src_lang = "en"
     if header is not None:
         src_lang = header.attrib.get("srclang", "en").lower()
 
@@ -32,9 +31,8 @@ def parse_tmx(file_content):
         target_text = ""
         
         tuvs = tu.findall("tuv")
-        if len(tuvs) < 2: continue # Skip if not a pair
+        if len(tuvs) < 2: continue
 
-        # Strategy 1: Use TMX 'srclang' to identify source
         for tuv in tuvs:
             lang = tuv.attrib.get(f"{{{ns['xml']}}}lang", "").lower()
             seg = tuv.find("seg")
@@ -47,7 +45,6 @@ def parse_tmx(file_content):
             else:
                 target_text = text
         
-        # Strategy 2: Fallback (First TUV is Source, Second is Target)
         if not source_text or not target_text:
              seg1 = tuvs[0].find("seg")
              seg2 = tuvs[1].find("seg")
@@ -203,6 +200,27 @@ def generate_output_filename(mode, v1_file, v2_file=None):
         return f"{base_name}_Report.html"
     return "BilingualDiff_Report.html"
 
+# NEW TER FUNCTION
+def calculate_word_edits(original: str, edited: str) -> int:
+    """Calculates word-level Levenshtein distance."""
+    words1 = original.strip().split()
+    words2 = edited.strip().split()
+    n, m = len(words1), len(words2)
+    if n == 0: return m
+    if m == 0: return n
+    matrix = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1): matrix[i][0] = i
+    for j in range(m + 1): matrix[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = 0 if words1[i - 1] == words2[j - 1] else 1
+            matrix[i][j] = min(
+                matrix[i - 1][j] + 1, 
+                matrix[i][j - 1] + 1, 
+                matrix[i - 1][j - 1] + cost
+            )
+    return matrix[n][m]
+
 def generate_html_report(v1_segs, v2_segs, filter_option):
     filtered = []
     
@@ -215,6 +233,10 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
     total_len_v1 = 0
     total_len_v2 = 0
     
+    # TER Trackers
+    corpus_word_edits = 0
+    corpus_ref_words = 0
+    
     for i, (seg1, seg2) in enumerate(zip(v1_segs, v2_segs), 1):
         source = seg1.get("source", "")
         v1 = seg1.get("target", "")
@@ -222,24 +244,37 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
         
         total_len_v1 += len(v1)
         total_len_v2 += len(v2)
+        
+        # Track words for Global TER
+        v1_word_count = len(v1.strip().split())
+        corpus_ref_words += v1_word_count
 
         status = "Same"
         score = 100 
+        ter_score = 0.0
 
         if v1 != v2:
             status = "Different"
             changed_strings += 1
             
+            # Similarity
             matcher = SequenceMatcher(None, v1, v2)
             score = round(matcher.ratio() * 100, 1)
             edit_distances.append(score)
             
+            # TER Calculation
+            edits = calculate_word_edits(v1, v2)
+            corpus_word_edits += edits
+            if v1_word_count > 0:
+                ter_score = round((edits / v1_word_count) * 100, 1)
+            else:
+                ter_score = 100.0 if len(v2.strip().split()) > 0 else 0.0
+            
+            # Words
             w1 = Counter(get_valid_words(v1))
             w2 = Counter(get_valid_words(v2))
-            
             removed = (w1 - w2).elements()
             removed_words_counter.update(removed)
-            
             added = (w2 - w1).elements()
             added_words_counter.update(added)
         else:
@@ -249,7 +284,8 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
         if filter_option == "same" and status == "Different": continue
 
         v1_hl, v2_hl = highlight_differences(v1, v2)
-        filtered.append((i, source, v1_hl, v2_hl, status, score))
+        # Added ter_score to the filtered list
+        filtered.append((i, source, v1_hl, v2_hl, status, score, ter_score))
 
     change_pct = (changed_strings / total_strings * 100) if total_strings > 0 else 0
     top5_removed = removed_words_counter.most_common(5)
@@ -258,6 +294,9 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
     
     changed_scores = [s for s in edit_distances if s < 100]
     avg_edit_score = sum(changed_scores) / len(changed_scores) if changed_scores else 100
+    
+    # Calculate Global Corpus TER
+    global_ter = (corpus_word_edits / corpus_ref_words * 100) if corpus_ref_words > 0 else 0
 
     edit_categories = {"Minor Edit (>85%)": 0, "Medium Edit (50-85%)": 0, "Major Rewrite (<50%)": 0}
     for s in changed_scores:
@@ -276,7 +315,7 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
         th, td {{ border: 1px solid #ddd; padding: 8px; vertical-align: top; }} 
         th {{ background-color: #f2f2f2; text-align: left; }} 
         .diff {{ background-color: #fff9db; }} 
-        .stats-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px; }}
+        .stats-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 20px; }}
         .stat-card {{ background: #f8f9fa; padding: 15px; border: 1px solid #ddd; border-radius: 8px; }}
         .stat-val {{ font-size: 1.2em; font-weight: bold; }}
         .stat-label {{ font-size: 0.9em; color: #666; }}
@@ -287,20 +326,22 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
     <div class="stats-grid">
         <div class="stat-card"><div class="stat-val">{total_strings}</div><div class="stat-label">Total Strings</div></div>
         <div class="stat-card"><div class="stat-val">{changed_strings} ({change_pct:.1f}%)</div><div class="stat-label">Changed Strings</div></div>
-        <div class="stat-card"><div class="stat-val">{expansion:+.1f}%</div><div class="stat-label">Expansion Factor</div></div>
+        <div class="stat-card"><div class="stat-val">{global_ter:.1f}%</div><div class="stat-label">Corpus TER</div></div>
         <div class="stat-card"><div class="stat-val">{avg_edit_score:.1f}%</div><div class="stat-label">Avg Similarity (on edits)</div></div>
+        <div class="stat-card"><div class="stat-val">{expansion:+.1f}%</div><div class="stat-label">Expansion Factor</div></div>
     </div>
     
     <p><b>Top Removed:</b> {list_to_html(top5_removed)}<br>
     <b>Top Added:</b> {list_to_html(top5_added)}</p>
 
     <table>
-    <tr><th>ID</th><th>Source</th><th>Original Version</th><th>Updated Version</th><th>Match %</th></tr>
+    <tr><th>ID</th><th>Source</th><th>Original Version</th><th>Updated Version</th><th>Sim %</th><th>TER %</th></tr>
     """
     
-    for seg_id, src, v1, v2, status, score in filtered:
+    for seg_id, src, v1, v2, status, score, ter_score in filtered:
         row_class = "diff" if status == "Different" else ""
-        html_out += f'<tr class="{row_class}"><td>{seg_id}</td><td>{src}</td><td>{v1}</td><td>{v2}</td><td>{score}%</td></tr>'
+        ter_str = f"{ter_score:.1f}%" if status == "Different" else "-"
+        html_out += f'<tr class="{row_class}"><td>{seg_id}</td><td>{src}</td><td>{v1}</td><td>{v2}</td><td>{score}%</td><td>{ter_str}</td></tr>'
     
     html_out += "</table></body></html>"
     
@@ -310,6 +351,7 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
         "pct": change_pct,
         "expansion": expansion,
         "avg_score": avg_edit_score,
+        "corpus_ter": global_ter,
         "top_removed": top5_removed,
         "top_added": top5_added,
         "graph_data": edit_categories
@@ -323,7 +365,6 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
 
 st.set_page_config(page_title="BilingualDiff", layout="wide")
 
-# CSS for Green Download Button
 st.markdown("""
     <style>
     div[data-testid="stDownloadButton"] button {
@@ -359,7 +400,6 @@ v2_file = None
 
 # 1. BILINGUAL FILES MODE
 if mode == "Bilingual Files (TMX/XLIFF)":
-    # Clear excel state if switching modes
     if 'excel_results' in st.session_state: del st.session_state['excel_results']
     
     col1, col2 = st.columns(2)
@@ -382,22 +422,22 @@ if mode == "Bilingual Files (TMX/XLIFF)":
                     
                     st.divider()
                     st.subheader("📊 Translation Analytics")
-                    m1, m2, m3, m4 = st.columns(4)
+                    m1, m2, m3, m4, m5 = st.columns(5)
                     m1.metric("Total Strings", stats["total"], help="Total count of segments found.")
                     m2.metric("Changed Strings", f"{stats['changed']} ({stats['pct']:.1f}%)", help="Number of segments with changes.")
-                    m3.metric("Expansion Factor", f"{stats['expansion']:+.1f}%", help="Length difference.")
-                    m4.metric("Avg Edit Similarity", f"{stats['avg_score']:.1f}%", help="Levenshtein score.")
+                    m3.metric("Corpus TER", f"{stats['corpus_ter']:.1f}%", help="Translation Edit Rate (Total Word Edits / Total Original Words). Lower is better.")
+                    m4.metric("Avg Edit Similarity", f"{stats['avg_score']:.1f}%", help="Character-level Levenshtein ratio on changed segments. Higher is better.")
+                    m5.metric("Expansion Factor", f"{stats['expansion']:+.1f}%", help="Length difference.")
                     st.divider()
                     
                 except Exception as e:
                     st.error(f"Error: {e}")
 
-# 2. EXCEL MULTI-FILE MODE (FIXED WITH SESSION STATE)
+# 2. EXCEL MULTI-FILE MODE 
 elif mode == "Excel (3 Columns)":
     v1_files = st.file_uploader("Upload Excel Files", type=["xlsx"], accept_multiple_files=True)
     st.info("Excel must have Source in Col A, Original in Col B, Updated in Col C.")
 
-    # A. PROCESSING BUTTON
     if st.button("Compare & Generate Reports"):
         if not v1_files:
             st.warning("Please upload at least one Excel file.")
@@ -419,14 +459,11 @@ elif mode == "Excel (3 Columns)":
                     except Exception as e:
                         st.error(f"Error processing {excel_file.name}: {e}")
             
-            # Store results in Session State to survive reruns
             st.session_state['excel_results'] = results_storage
 
-    # B. RENDER RESULTS (FROM SESSION STATE)
     if 'excel_results' in st.session_state and st.session_state['excel_results']:
         st.success(f"Processed {len(st.session_state['excel_results'])} files.")
         
-        # --- ZIP DOWNLOAD (DOWNLOAD ALL) ---
         if len(st.session_state['excel_results']) > 1:
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -442,7 +479,6 @@ elif mode == "Excel (3 Columns)":
             )
             st.divider()
 
-        # --- INDIVIDUAL DOWNLOADS ---
         for i, res in enumerate(st.session_state['excel_results']):
             col_a, col_b = st.columns([3, 1])
             with col_a:
@@ -450,19 +486,19 @@ elif mode == "Excel (3 Columns)":
             with col_b:
                 with st.expander("Stats"):
                      st.write(f"Changed: {res['stats']['changed']} ({res['stats']['pct']:.1f}%)")
+                     st.write(f"Corpus TER: {res['stats']['corpus_ter']:.1f}%")
 
             st.download_button(
                 label=f"⬇️ DOWNLOAD REPORT ({res['filename']})",
                 data=res['html'],
                 file_name=res['filename'],
                 mime="text/html",
-                key=f"dl_btn_{i}" # Unique key is crucial
+                key=f"dl_btn_{i}" 
             )
             st.markdown("---")
 
 # 3. WOL REPORT MODE
 elif mode == "WOL Report":
-    # Clear excel state if switching modes
     if 'excel_results' in st.session_state: del st.session_state['excel_results']
 
     v1_file = st.file_uploader("Upload WOL HTML Report", type=["html", "htm"])
