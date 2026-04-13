@@ -319,8 +319,10 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
         .stat-card {{ background: #f8f9fa; padding: 15px; border: 1px solid #ddd; border-radius: 8px; }}
         .stat-val {{ font-size: 1.2em; font-weight: bold; }}
         .stat-label {{ font-size: 0.9em; color: #666; }}
+        .attribution {{ font-size: 0.8em; color: #888; text-align: right; margin-bottom: 4px; }}
     </style>
     </head><body>
+    <div class="attribution">BilingualDiff v.1.2 - Developed by Ahmet Ozerdem</div>
     <h2>Comparison Report</h2>
     
     <div class="stats-grid">
