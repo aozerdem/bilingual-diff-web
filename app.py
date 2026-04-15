@@ -367,21 +367,33 @@ def generate_excel_report(v1_segs, v2_segs, filter_option):
     workbook = xlsxwriter.Workbook(output, {'in_memory': True})
     worksheet = workbook.add_worksheet('Comparison Report')
     
-    # Formats
+    # --- Formats ---
+    # Table Formats
     header_fmt = workbook.add_format({'bold': True, 'bg_color': '#f2f2f2', 'border': 1})
     cell_fmt = workbook.add_format({'border': 1, 'text_wrap': True, 'valign': 'top'})
     diff_bg_fmt = workbook.add_format({'bg_color': '#fff9db', 'border': 1, 'text_wrap': True, 'valign': 'top'})
     
+    # Rich Text Formats
     red_fmt = workbook.add_format({'font_color': '#9c0006', 'bg_color': '#ffdce0', 'font_strikeout': True})
     green_fmt = workbook.add_format({'font_color': '#006100', 'bg_color': '#e2ffdc'})
     default_fmt = workbook.add_format({'font_color': '#000000'})
 
+    # Dashboard Formats (NEW)
+    title_fmt = workbook.add_format({'bold': True, 'font_size': 16})
+    attr_fmt = workbook.add_format({'italic': True, 'font_color': '#888888', 'align': 'right'})
+    stat_lbl_fmt = workbook.add_format({'font_color': '#666666'})
+    stat_val_fmt = workbook.add_format({'bold': True, 'font_size': 14})
+    top_words_fmt = workbook.add_format({'text_wrap': True, 'valign': 'top'})
+
+    # --- Setup Table Starting Row ---
+    TABLE_START_ROW = 8
+    
     headers = ['ID', 'Source', 'Original Version', 'Updated Version', 'Sim %', 'TER %']
     for col_num, header in enumerate(headers):
-        worksheet.write(0, col_num, header, header_fmt)
+        worksheet.write(TABLE_START_ROW, col_num, header, header_fmt)
         
-    worksheet.set_column('A:A', 5)
-    worksheet.set_column('B:D', 40)
+    worksheet.set_column('A:A', 6)
+    worksheet.set_column('B:D', 45)
     worksheet.set_column('E:F', 10)
 
     total_strings = len(v1_segs)
@@ -392,7 +404,7 @@ def generate_excel_report(v1_segs, v2_segs, filter_option):
     total_len_v1, total_len_v2 = 0, 0
     corpus_word_edits, corpus_ref_words = 0, 0
     
-    row_idx = 1
+    row_idx = TABLE_START_ROW + 1
     
     for i, (seg1, seg2) in enumerate(zip(v1_segs, v2_segs), 1):
         source = seg1.get("source", "")
@@ -476,14 +488,44 @@ def generate_excel_report(v1_segs, v2_segs, filter_option):
         
         row_idx += 1
 
-    workbook.close()
-    
+    # --- Calculations ---
     change_pct = (changed_strings / total_strings * 100) if total_strings > 0 else 0
     expansion = ((total_len_v2 - total_len_v1) / total_len_v1 * 100) if total_len_v1 > 0 else 0
     changed_scores = [s for s in edit_distances if s < 100]
     avg_edit_score = sum(changed_scores) / len(changed_scores) if changed_scores else 100
     global_ter = (corpus_word_edits / corpus_ref_words * 100) if corpus_ref_words > 0 else 0
 
+    top5_removed = removed_words_counter.most_common(5)
+    top5_added = added_words_counter.most_common(5)
+
+    def list_to_str(lst):
+        return ", ".join([f"{w} ({c})" for w, c in lst]) if lst else "None"
+
+    # --- WRITE DASHBOARD TO TOP OF EXCEL ---
+    worksheet.write(0, 0, "Comparison Report", title_fmt)
+    worksheet.merge_range(0, 4, 0, 5, "BilingualDiff v.1.2 - Developed by Ahmet Ozerdem", attr_fmt)
+
+    # Labels
+    worksheet.write(2, 0, "Total Strings", stat_lbl_fmt)
+    worksheet.write(2, 1, "Changed Strings", stat_lbl_fmt)
+    worksheet.write(2, 2, "Corpus TER", stat_lbl_fmt)
+    worksheet.write(2, 3, "Avg Sim (on edits)", stat_lbl_fmt)
+    worksheet.write(2, 4, "Expansion Factor", stat_lbl_fmt)
+
+    # Values
+    worksheet.write(3, 0, total_strings, stat_val_fmt)
+    worksheet.write(3, 1, f"{changed_strings} ({change_pct:.1f}%)", stat_val_fmt)
+    worksheet.write(3, 2, f"{global_ter:.1f}%", stat_val_fmt)
+    worksheet.write(3, 3, f"{avg_edit_score:.1f}%", stat_val_fmt)
+    worksheet.write(3, 4, f"{expansion:+.1f}%", stat_val_fmt)
+
+    # Top Words (Merged across columns A to F)
+    worksheet.merge_range(5, 0, 5, 5, f"Top Removed: {list_to_str(top5_removed)}", top_words_fmt)
+    worksheet.merge_range(6, 0, 6, 5, f"Top Added: {list_to_str(top5_added)}", top_words_fmt)
+
+    workbook.close()
+    
+    # Analytics for UI Graph
     edit_categories = {"Minor Edit (>85%)": 0, "Medium Edit (50-85%)": 0, "Major Rewrite (<50%)": 0}
     for s in changed_scores:
         if s > 85: edit_categories["Minor Edit (>85%)"] += 1
@@ -493,8 +535,7 @@ def generate_excel_report(v1_segs, v2_segs, filter_option):
     stats = {
         "total": total_strings, "changed": changed_strings, "pct": change_pct,
         "expansion": expansion, "avg_score": avg_edit_score, "corpus_ter": global_ter,
-        "top_removed": removed_words_counter.most_common(5), 
-        "top_added": added_words_counter.most_common(5), 
+        "top_removed": top5_removed, "top_added": top5_added, 
         "graph_data": edit_categories
     }
     return output.getvalue(), stats
