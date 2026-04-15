@@ -10,6 +10,7 @@ from collections import Counter
 import io
 import os
 import zipfile
+import xlsxwriter
 
 # ==========================================
 # PART 1: CORE PARSING LOGIC
@@ -361,6 +362,154 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
     
     return html_out, stats
 
+def generate_excel_report(v1_segs, v2_segs, filter_option):
+    output = io.BytesIO()
+    workbook = xlsxwriter.Workbook(output, {'in_memory': True})
+    worksheet = workbook.add_worksheet('Comparison Report')
+    
+    # Formats
+    header_fmt = workbook.add_format({'bold': True, 'bg_color': '#f2f2f2', 'border': 1})
+    cell_fmt = workbook.add_format({'border': 1, 'text_wrap': True, 'valign': 'top'})
+    diff_bg_fmt = workbook.add_format({'bg_color': '#fff9db', 'border': 1, 'text_wrap': True, 'valign': 'top'})
+    
+    red_fmt = workbook.add_format({'font_color': '#9c0006', 'bg_color': '#ffdce0', 'strikeout': True})
+    green_fmt = workbook.add_format({'font_color': '#006100', 'bg_color': '#e2ffdc'})
+    default_fmt = workbook.add_format({'font_color': '#000000'})
+
+    headers = ['ID', 'Source', 'Original Version', 'Updated Version', 'Sim %', 'TER %']
+    for col_num, header in enumerate(headers):
+        worksheet.write(0, col_num, header, header_fmt)
+        
+    worksheet.set_column('A:A', 5)
+    worksheet.set_column('B:D', 40)
+    worksheet.set_column('E:F', 10)
+
+    total_strings = len(v1_segs)
+    changed_strings = 0
+    removed_words_counter = Counter()
+    added_words_counter = Counter()
+    edit_distances = [] 
+    total_len_v1, total_len_v2 = 0, 0
+    corpus_word_edits, corpus_ref_words = 0, 0
+    
+    row_idx = 1
+    
+    for i, (seg1, seg2) in enumerate(zip(v1_segs, v2_segs), 1):
+        source = seg1.get("source", "")
+        v1 = seg1.get("target", "")
+        v2 = seg2.get("target", "")
+        
+        total_len_v1 += len(v1)
+        total_len_v2 += len(v2)
+        v1_word_count = len(v1.strip().split())
+        corpus_ref_words += v1_word_count
+
+        status = "Same"
+        score = 100 
+        ter_score = 0.0
+
+        if v1 != v2:
+            status = "Different"
+            changed_strings += 1
+            
+            score = round(SequenceMatcher(None, v1, v2).ratio() * 100, 1)
+            edit_distances.append(score)
+            
+            edits = calculate_word_edits(v1, v2)
+            corpus_word_edits += edits
+            if v1_word_count > 0: ter_score = round((edits / v1_word_count) * 100, 1)
+            else: ter_score = 100.0 if len(v2.strip().split()) > 0 else 0.0
+            
+            w1, w2 = Counter(get_valid_words(v1)), Counter(get_valid_words(v2))
+            removed_words_counter.update((w1 - w2).elements())
+            added_words_counter.update((w2 - w1).elements())
+        else:
+             edit_distances.append(100)
+
+        if filter_option == "diff" and status == "Same": continue
+        if filter_option == "same" and status == "Different": continue
+
+        current_fmt = diff_bg_fmt if status == "Different" else cell_fmt
+        
+        worksheet.write(row_idx, 0, i, current_fmt)
+        worksheet.write(row_idx, 1, source, current_fmt)
+        worksheet.write(row_idx, 4, f"{score}%", current_fmt)
+        worksheet.write(row_idx, 5, f"{ter_score:.1f}%" if status == "Different" else "-", current_fmt)
+
+        if status == "Different":
+            diff = list(ndiff(v1, v2))
+            v1_chunks, v2_chunks = [], []
+            
+            for d in diff:
+                code, char = d[0], d[2:]
+                if code == ' ':
+                    v1_chunks.extend([default_fmt, char])
+                    v2_chunks.extend([default_fmt, char])
+                elif code == '-':
+                    v1_chunks.extend([red_fmt, char])
+                elif code == '+':
+                    v2_chunks.extend([green_fmt, char])
+                    
+            def optimize_chunks(chunks):
+                opt = []
+                curr_fmt, curr_str = None, ""
+                for j in range(0, len(chunks), 2):
+                    fmt, text = chunks[j], chunks[j+1]
+                    if fmt == curr_fmt: curr_str += text
+                    else:
+                        if curr_str: opt.extend([curr_fmt, curr_str])
+                        curr_fmt, curr_str = fmt, text
+                if curr_str: opt.extend([curr_fmt, curr_str])
+                return opt
+            
+            v1_opt = optimize_chunks(v1_chunks)
+            v2_opt = optimize_chunks(v2_chunks)
+            
+            if len(v1_opt) > 2: worksheet.write_rich_string(row_idx, 2, *v1_opt, current_fmt)
+            else: worksheet.write(row_idx, 2, v1_opt[1] if len(v1_opt)==2 else v1, current_fmt)
+            
+            if len(v2_opt) > 2: worksheet.write_rich_string(row_idx, 3, *v2_opt, current_fmt)
+            else: worksheet.write(row_idx, 3, v2_opt[1] if len(v2_opt)==2 else v2, current_fmt)
+        else:
+            worksheet.write(row_idx, 2, v1, current_fmt)
+            worksheet.write(row_idx, 3, v2, current_fmt)
+        
+        row_idx += 1
+
+    workbook.close()
+    
+    change_pct = (changed_strings / total_strings * 100) if total_strings > 0 else 0
+    expansion = ((total_len_v2 - total_len_v1) / total_len_v1 * 100) if total_len_v1 > 0 else 0
+    changed_scores = [s for s in edit_distances if s < 100]
+    avg_edit_score = sum(changed_scores) / len(changed_scores) if changed_scores else 100
+    global_ter = (corpus_word_edits / corpus_ref_words * 100) if corpus_ref_words > 0 else 0
+
+    edit_categories = {"Minor Edit (>85%)": 0, "Medium Edit (50-85%)": 0, "Major Rewrite (<50%)": 0}
+    for s in changed_scores:
+        if s > 85: edit_categories["Minor Edit (>85%)"] += 1
+        elif s >= 50: edit_categories["Medium Edit (50-85%)"] += 1
+        else: edit_categories["Major Rewrite (<50%)"] += 1
+
+    stats = {
+        "total": total_strings, "changed": changed_strings, "pct": change_pct,
+        "expansion": expansion, "avg_score": avg_edit_score, "corpus_ter": global_ter,
+        "top_removed": removed_words_counter.most_common(5), 
+        "top_added": added_words_counter.most_common(5), 
+        "graph_data": edit_categories
+    }
+    return output.getvalue(), stats
+
+def generate_report_based_on_toggle(v1_segs, v2_segs, filter_val, export_fmt, mode, f1, f2=None):
+    if export_fmt == "HTML Report":
+        data, stats = generate_html_report(v1_segs, v2_segs, filter_val)
+        filename = generate_output_filename(mode, f1, f2)
+        mime = "text/html"
+    else:
+        data, stats = generate_excel_report(v1_segs, v2_segs, filter_val)
+        filename = generate_output_filename(mode, f1, f2).replace(".html", ".xlsx")
+        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return data, stats, filename, mime
+
 # ==========================================
 # PART 3: STREAMLIT UI
 # ==========================================
@@ -396,6 +545,9 @@ with st.sidebar:
     mode = st.selectbox("Select Mode", ["Bilingual Files (TMX/XLIFF)", "Excel (3 Columns)", "WOL Report"])
     filter_opt = st.radio("Export Filter", ["All Segments", "Only DIFFERENT", "Only SAME"], index=0)
     filter_map = {"All Segments": "all", "Only DIFFERENT": "diff", "Only SAME": "same"}
+    
+    # --- ADD THIS NEW TOGGLE ---
+    export_format = st.radio("Export Format", ["HTML Report", "Excel (.xlsx) Report"], index=0)
 
 v1_file = None
 v2_file = None
@@ -416,11 +568,12 @@ if mode == "Bilingual Files (TMX/XLIFF)":
                 try:
                     v1_segs = load_segments(v1_file, True)
                     v2_segs = load_segments(v2_file, False)
-                    report_html, stats = generate_html_report(v1_segs, v2_segs, filter_map[filter_opt])
-                    out_filename = generate_output_filename(mode, v1_file, v2_file)
+                    file_data, stats, out_filename, mime_type = generate_report_based_on_toggle(
+                        v1_segs, v2_segs, filter_map[filter_opt], export_format, mode, v1_file, v2_file
+                    )
                     
                     st.success("Comparison Complete!")
-                    st.download_button(label=f"⬇️ DOWNLOAD REPORT ({out_filename})", data=report_html, file_name=out_filename, mime="text/html")
+                    st.download_button(label=f"⬇️ DOWNLOAD REPORT ({out_filename})", data=file_data, file_name=out_filename, mime=mime_type)
                     
                     st.divider()
                     st.subheader("📊 Translation Analytics")
@@ -449,13 +602,14 @@ elif mode == "Excel (3 Columns)":
                 with st.spinner(f"Processing {excel_file.name}..."):
                     try:
                         v1_segs, v2_segs = parse_excel(excel_file)
-                        report_html, stats = generate_html_report(v1_segs, v2_segs, filter_map[filter_opt])
-                        out_filename = generate_output_filename(mode, excel_file)
+                        file_data, stats, out_filename, mime_type = generate_report_based_on_toggle(
+                            v1_segs, v2_segs, filter_map[filter_opt], export_format, mode, excel_file
+                        )
                         
                         results_storage.append({
                             "filename": out_filename,
                             "original_name": excel_file.name,
-                            "html": report_html,
+                            "html": file_data,
                             "stats": stats
                         })
                     except Exception as e:
@@ -470,7 +624,8 @@ elif mode == "Excel (3 Columns)":
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                 for res in st.session_state['excel_results']:
-                    zf.writestr(res['filename'], res['html'])
+                    file_content = res['html'] if isinstance(res['html'], bytes) else res['html'].encode('utf-8')
+                    zf.writestr(res['filename'], file_content)
             
             st.download_button(
                 label="📦 DOWNLOAD ALL REPORTS (.ZIP)",
@@ -490,11 +645,13 @@ elif mode == "Excel (3 Columns)":
                      st.write(f"Changed: {res['stats']['changed']} ({res['stats']['pct']:.1f}%)")
                      st.write(f"Corpus TER: {res['stats']['corpus_ter']:.1f}%")
 
+            file_content = res['html'] if isinstance(res['html'], bytes) else res['html'].encode('utf-8')
+            mime_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if res['filename'].endswith('.xlsx') else "text/html"
             st.download_button(
                 label=f"⬇️ DOWNLOAD REPORT ({res['filename']})",
-                data=res['html'],
+                data=file_content,
                 file_name=res['filename'],
-                mime="text/html",
+                mime=mime_type,
                 key=f"dl_btn_{i}" 
             )
             st.markdown("---")
@@ -512,9 +669,10 @@ elif mode == "WOL Report":
                 try:
                     v1_segs = load_segments(v1_file, True)
                     v2_segs = load_segments(v1_file, False)
-                    report_html, stats = generate_html_report(v1_segs, v2_segs, filter_map[filter_opt])
-                    out_filename = generate_output_filename(mode, v1_file)
+                    file_data, stats, out_filename, mime_type = generate_report_based_on_toggle(
+                        v1_segs, v2_segs, filter_map[filter_opt], export_format, mode, v1_file
+                    )
                     st.success("Comparison Complete!")
-                    st.download_button(label=f"⬇️ DOWNLOAD REPORT ({out_filename})", data=report_html, file_name=out_filename, mime="text/html")
+                    st.download_button(label=f"⬇️ DOWNLOAD REPORT ({out_filename})", data=file_data, file_name=out_filename, mime=mime_type)
                 except Exception as e:
                     st.error(f"Error: {e}")
