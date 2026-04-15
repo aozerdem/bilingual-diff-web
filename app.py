@@ -588,7 +588,7 @@ with st.sidebar:
     filter_map = {"All Segments": "all", "Only DIFFERENT": "diff", "Only SAME": "same"}
     
     # --- ADD THIS NEW TOGGLE ---
-    export_format = st.radio("Export Format", ["HTML Report", "Excel (.xlsx) Report"], index=0)
+    export_format = st.radio("Export Format", ["HTML Report", "Excel (.xlsx) Report"], index=1)
 
 v1_file = None
 v2_file = None
