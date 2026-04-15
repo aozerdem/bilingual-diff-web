@@ -372,7 +372,7 @@ def generate_excel_report(v1_segs, v2_segs, filter_option):
     cell_fmt = workbook.add_format({'border': 1, 'text_wrap': True, 'valign': 'top'})
     diff_bg_fmt = workbook.add_format({'bg_color': '#fff9db', 'border': 1, 'text_wrap': True, 'valign': 'top'})
     
-    red_fmt = workbook.add_format({'font_color': '#9c0006', 'bg_color': '#ffdce0', 'strikeout': True})
+    red_fmt = workbook.add_format({'font_color': '#9c0006', 'bg_color': '#ffdce0', 'font_strikeout': True})
     green_fmt = workbook.add_format({'font_color': '#006100', 'bg_color': '#e2ffdc'})
     default_fmt = workbook.add_format({'font_color': '#000000'})
 
