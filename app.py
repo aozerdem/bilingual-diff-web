@@ -158,6 +158,10 @@ def load_segments(uploaded_file, is_original=True):
 # PART 2: EXPORT & COMPARE LOGIC
 # ==========================================
 
+def tokenize_for_ter(text: str) -> list:
+    """Industry-standard tokenizer for TER: lowercases and isolates punctuation symbols."""
+    return re.findall(r"\b\w+\b|[^\w\s]", text.lower())
+
 def get_valid_words(text):
     words = re.findall(r'\b\w+\b', text.lower())
     valid = []
@@ -201,11 +205,10 @@ def generate_output_filename(mode, v1_file, v2_file=None):
         return f"{base_name}_Report.html"
     return "BilingualDiff_Report.html"
 
-# NEW TER FUNCTION
 def calculate_word_edits(original: str, edited: str) -> int:
-    """Calculates word-level Levenshtein distance."""
-    words1 = original.strip().split()
-    words2 = edited.strip().split()
+    """Calculates normalized, word-level Levenshtein distance."""
+    words1 = tokenize_for_ter(original)
+    words2 = tokenize_for_ter(edited)
     n, m = len(words1), len(words2)
     if n == 0: return m
     if m == 0: return n
@@ -246,8 +249,9 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
         total_len_v1 += len(v1)
         total_len_v2 += len(v2)
         
-        # Track words for Global TER
-        v1_word_count = len(v1.strip().split())
+        # Track words for Global TER using standard normalization token count
+        v1_tokens = tokenize_for_ter(v1)
+        v1_word_count = len(v1_tokens)
         corpus_ref_words += v1_word_count
 
         status = "Same"
@@ -263,13 +267,13 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
             score = round(matcher.ratio() * 100, 1)
             edit_distances.append(score)
             
-            # TER Calculation
+            # Normalized TER Calculation
             edits = calculate_word_edits(v1, v2)
             corpus_word_edits += edits
             if v1_word_count > 0:
                 ter_score = round((edits / v1_word_count) * 100, 1)
             else:
-                ter_score = 100.0 if len(v2.strip().split()) > 0 else 0.0
+                ter_score = 100.0 if len(tokenize_for_ter(v2)) > 0 else 0.0
             
             # Words
             w1 = Counter(get_valid_words(v1))
@@ -285,7 +289,6 @@ def generate_html_report(v1_segs, v2_segs, filter_option):
         if filter_option == "same" and status == "Different": continue
 
         v1_hl, v2_hl = highlight_differences(v1, v2)
-        # Added ter_score to the filtered list
         filtered.append((i, source, v1_hl, v2_hl, status, score, ter_score))
 
     change_pct = (changed_strings / total_strings * 100) if total_strings > 0 else 0
@@ -368,24 +371,20 @@ def generate_excel_report(v1_segs, v2_segs, filter_option):
     worksheet = workbook.add_worksheet('Comparison Report')
     
     # --- Formats ---
-    # Table Formats
     header_fmt = workbook.add_format({'bold': True, 'bg_color': '#f2f2f2', 'border': 1})
     cell_fmt = workbook.add_format({'border': 1, 'text_wrap': True, 'valign': 'top'})
     diff_bg_fmt = workbook.add_format({'bg_color': '#fff9db', 'border': 1, 'text_wrap': True, 'valign': 'top'})
     
-    # Rich Text Formats
     red_fmt = workbook.add_format({'font_color': '#9c0006', 'bg_color': '#ffdce0', 'font_strikeout': True})
     green_fmt = workbook.add_format({'font_color': '#006100', 'bg_color': '#e2ffdc'})
     default_fmt = workbook.add_format({'font_color': '#000000'})
 
-    # Dashboard Formats (NEW)
     title_fmt = workbook.add_format({'bold': True, 'font_size': 16})
     attr_fmt = workbook.add_format({'italic': True, 'font_color': '#888888', 'align': 'right'})
     stat_lbl_fmt = workbook.add_format({'font_color': '#666666'})
     stat_val_fmt = workbook.add_format({'bold': True, 'font_size': 14})
     top_words_fmt = workbook.add_format({'text_wrap': True, 'valign': 'top'})
 
-    # --- Setup Table Starting Row ---
     TABLE_START_ROW = 8
     
     headers = ['ID', 'Source', 'Original Version', 'Updated Version', 'Sim %', 'TER %']
@@ -413,7 +412,8 @@ def generate_excel_report(v1_segs, v2_segs, filter_option):
         
         total_len_v1 += len(v1)
         total_len_v2 += len(v2)
-        v1_word_count = len(v1.strip().split())
+        v1_tokens = tokenize_for_ter(v1)
+        v1_word_count = len(v1_tokens)
         corpus_ref_words += v1_word_count
 
         status = "Same"
@@ -430,7 +430,7 @@ def generate_excel_report(v1_segs, v2_segs, filter_option):
             edits = calculate_word_edits(v1, v2)
             corpus_word_edits += edits
             if v1_word_count > 0: ter_score = round((edits / v1_word_count) * 100, 1)
-            else: ter_score = 100.0 if len(v2.strip().split()) > 0 else 0.0
+            else: ter_score = 100.0 if len(tokenize_for_ter(v2)) > 0 else 0.0
             
             w1, w2 = Counter(get_valid_words(v1)), Counter(get_valid_words(v2))
             removed_words_counter.update((w1 - w2).elements())
@@ -519,7 +519,7 @@ def generate_excel_report(v1_segs, v2_segs, filter_option):
     worksheet.write(3, 3, f"{avg_edit_score:.1f}%", stat_val_fmt)
     worksheet.write(3, 4, f"{expansion:+.1f}%", stat_val_fmt)
 
-    # Top Words (Merged across columns A to F)
+    # Top Words
     worksheet.merge_range(5, 0, 5, 5, f"Top Removed: {list_to_str(top5_removed)}", top_words_fmt)
     worksheet.merge_range(6, 0, 6, 5, f"Top Added: {list_to_str(top5_added)}", top_words_fmt)
 
@@ -587,7 +587,6 @@ with st.sidebar:
     filter_opt = st.radio("Export Filter", ["All Segments", "Only DIFFERENT", "Only SAME"], index=0)
     filter_map = {"All Segments": "all", "Only DIFFERENT": "diff", "Only SAME": "same"}
     
-    # --- ADD THIS NEW TOGGLE ---
     export_format = st.radio("Export Format", ["HTML Report", "Excel (.xlsx) Report"], index=1)
 
 v1_file = None
