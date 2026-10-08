@@ -149,10 +149,58 @@ def load_segments(uploaded_file, is_original=True):
         return parse_excel(uploaded_file)[0] if is_original else parse_excel(uploaded_file)[1]
     elif filename.endswith(".htm") or filename.endswith(".html"):
         return parse_wol_html(uploaded_file, is_original)
-    elif filename.endswith(".mxliff") or filename.endswith(".sdlxliff"):
+    elif filename.endswith((".mxliff", ".sdlxliff", ".xlf", ".xliff")):
         return parse_xliff(uploaded_file)
     else:
         return []
+
+BILINGUAL_EXTS = (".tmx", ".mxliff", ".sdlxliff", ".xlf", ".xliff")
+
+class BilingualFile(io.BytesIO):
+    """In-memory bilingual file (uploaded directly or extracted from a zip)."""
+    def __init__(self, data, name, display_name):
+        super().__init__(data)
+        self.name = name                  # base file name, used for parsing and name matching
+        self.display_name = display_name  # full path incl. zip name, shown in the UI
+        self.lang = detect_target_language(data, display_name)
+
+def detect_target_language(data, path=""):
+    """Reads the target language from the file header; falls back to a locale code (e.g. ar-AE) in the path."""
+    head = data[:100000].decode("utf-8", errors="ignore")
+    m = re.search(r'\b(?:target-language|trgLang)\s*=\s*["\']([^"\']+)["\']', head)
+    if m:
+        return m.group(1).strip().lower().replace("_", "-")
+    if "<tmx" in head:
+        src = re.search(r'\bsrclang\s*=\s*["\']([^"\']+)["\']', head)
+        src_lang = src.group(1).lower() if src else ""
+        for lang in re.findall(r'xml:lang\s*=\s*["\']([^"\']+)["\']', head):
+            lang = lang.lower().replace("_", "-")
+            if lang != src_lang.replace("_", "-"):
+                return lang
+    m = re.search(r'(?<![A-Za-z])([a-z]{2,3}[-_][A-Z]{2})(?![A-Za-z])', path)
+    if m:
+        return m.group(1).lower().replace("_", "-")
+    return "unknown"
+
+def collect_bilingual_files(uploaded_files):
+    """Expands zip uploads and keeps only bilingual files. Returns (files, skipped_names)."""
+    files, skipped = [], []
+    for up in uploaded_files or []:
+        if up.name.lower().endswith(".zip"):
+            up.seek(0)
+            with zipfile.ZipFile(up) as zf:
+                for info in zf.infolist():
+                    if info.is_dir() or "__MACOSX" in info.filename: continue
+                    full_name = f"{up.name}/{info.filename}"
+                    if info.filename.lower().endswith(BILINGUAL_EXTS):
+                        files.append(BilingualFile(zf.read(info), os.path.basename(info.filename), full_name))
+                    else:
+                        skipped.append(full_name)
+        elif up.name.lower().endswith(BILINGUAL_EXTS):
+            files.append(BilingualFile(up.getvalue(), up.name, up.name))
+        else:
+            skipped.append(up.name)
+    return files, skipped
 
 # ==========================================
 # PART 2: EXPORT & COMPARE LOGIC
@@ -195,8 +243,10 @@ def generate_output_filename(mode, v1_file, v2_file=None):
     if mode == "Bilingual Files (TMX/XLIFF)" and v1_file and v2_file:
         name1 = v1_file.name
         name2 = v2_file.name
-        lang_match = re.search(r'([a-z]{2}[-_][a-z]{2})', name1, re.IGNORECASE)
-        lang_code = lang_match.group(1).lower() if lang_match else "unknown"
+        lang_code = getattr(v1_file, "lang", None)
+        if not lang_code or lang_code == "unknown":
+            lang_match = re.search(r'([a-z]{2}[-_][a-z]{2})', name1, re.IGNORECASE)
+            lang_code = lang_match.group(1).lower() if lang_match else "unknown"
         part1 = name1[:15]
         part2 = name2[:15]
         return f"{lang_code}_{part1}_vs_{part2}.html"
@@ -540,6 +590,48 @@ def generate_excel_report(v1_segs, v2_segs, filter_option):
     }
     return output.getvalue(), stats
 
+def name_similarity(f1, f2):
+    """(file name score, full path score) - the path score only breaks ties between identical names."""
+    n1, n2 = os.path.splitext(f1.name)[0].lower(), os.path.splitext(f2.name)[0].lower()
+    p1 = getattr(f1, "display_name", f1.name).lower()
+    p2 = getattr(f2, "display_name", f2.name).lower()
+    return SequenceMatcher(None, n1, n2).ratio(), SequenceMatcher(None, p1, p2).ratio()
+
+def match_files_by_name(orig_files, upd_files, threshold):
+    """Pairs original/updated files one-to-one by file name similarity (best matches first).
+    Files are only paired when their target languages are the same."""
+    if len(orig_files) == 1 and len(upd_files) == 1:
+        o, u = orig_files[0], upd_files[0]
+        return [(o, u, name_similarity(o, u)[0])], [], []
+
+    candidates = []
+    for i, o in enumerate(orig_files):
+        for j, u in enumerate(upd_files):
+            if getattr(o, "lang", None) != getattr(u, "lang", None): continue
+            candidates.append((*name_similarity(o, u), i, j))
+    candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+
+    used_o, used_u, pairs = set(), set(), []
+    for score, _, i, j in candidates:
+        if score < threshold: break
+        if i in used_o or j in used_u: continue
+        used_o.add(i)
+        used_u.add(j)
+        pairs.append((orig_files[i], upd_files[j], score))
+
+    unmatched_o = [f for i, f in enumerate(orig_files) if i not in used_o]
+    unmatched_u = [f for j, f in enumerate(upd_files) if j not in used_u]
+    return pairs, unmatched_o, unmatched_u
+
+def make_unique_filename(filename, taken):
+    base, ext = os.path.splitext(filename)
+    candidate, n = filename, 2
+    while candidate in taken:
+        candidate = f"{base}_{n}{ext}"
+        n += 1
+    taken.add(candidate)
+    return candidate
+
 def generate_report_based_on_toggle(v1_segs, v2_segs, filter_val, export_fmt, mode, f1, f2=None):
     if export_fmt == "HTML Report":
         data, stats = generate_html_report(v1_segs, v2_segs, filter_val)
@@ -597,36 +689,124 @@ if mode == "Bilingual Files (TMX/XLIFF)":
     if 'excel_results' in st.session_state: del st.session_state['excel_results']
     
     col1, col2 = st.columns(2)
-    v1_file = col1.file_uploader("Upload Original Version", type=["tmx", "mxliff", "sdlxliff"])
-    v2_file = col2.file_uploader("Upload Updated Version", type=["tmx", "mxliff", "sdlxliff"])
-    
+    upload_types = ["tmx", "mxliff", "sdlxliff", "xlf", "xliff", "zip"]
+    v1_uploads = col1.file_uploader("Upload Original Version(s)", type=upload_types, accept_multiple_files=True)
+    v2_uploads = col2.file_uploader("Upload Updated Version(s)", type=upload_types, accept_multiple_files=True)
+    st.caption("Zip files are searched for bilingual files (TMX/XLIFF/MXLIFF/SDLXLIFF); other files are skipped. "
+               "Files are only paired with files of the same target language.")
+    match_threshold = st.slider("File Name Match Threshold (%)", 50, 100, 90,
+                                help="Original and updated files are paired by file name similarity. Pairs below this score are left unmatched.")
+
+    v1_files, v1_skipped = collect_bilingual_files(v1_uploads)
+    v2_files, v2_skipped = collect_bilingual_files(v2_uploads)
+    if v1_skipped or v2_skipped:
+        with st.expander(f"Skipped {len(v1_skipped) + len(v2_skipped)} non-bilingual file(s)"):
+            for name in v1_skipped + v2_skipped: st.write(name)
+
+    pairs, unmatched_v1, unmatched_v2 = [], [], []
+    if v1_files and v2_files:
+        pairs, unmatched_v1, unmatched_v2 = match_files_by_name(v1_files, v2_files, match_threshold / 100)
+        st.subheader("🔗 File Mapping")
+        if pairs:
+            st.dataframe(pd.DataFrame([
+                {"Target Lang": o.lang, "Original File": o.display_name, "Updated File": u.display_name, "Name Match %": round(s * 100, 1)}
+                for o, u, s in sorted(pairs, key=lambda p: (p[0].lang, p[0].display_name))
+            ]), use_container_width=True)
+        if unmatched_v1:
+            st.warning("Unmatched original files (skipped): " + ", ".join(f"{f.display_name} [{f.lang}]" for f in unmatched_v1))
+        if unmatched_v2:
+            st.warning("Unmatched updated files (skipped): " + ", ".join(f"{f.display_name} [{f.lang}]" for f in unmatched_v2))
+    elif v1_uploads and v2_uploads:
+        st.warning("No bilingual files found in the uploads.")
+
+    # Drop old results when the uploads or settings change
+    current_sig = ([f.name for f in v1_uploads or []], [f.name for f in v2_uploads or []], match_threshold, filter_opt, export_format)
+    if st.session_state.get('bilingual_sig') != current_sig:
+        st.session_state.pop('bilingual_results', None)
+
     if st.button("Compare & Generate Report"):
-        if not v1_file or not v2_file:
-            st.warning("Please upload both files.")
+        if not v1_files or not v2_files:
+            st.warning("Please upload both original and updated files.")
+        elif not pairs:
+            st.error("No file pairs could be matched. Try lowering the match threshold.")
         else:
-            with st.spinner("Processing..."):
-                try:
-                    v1_segs = load_segments(v1_file, True)
-                    v2_segs = load_segments(v2_file, False)
-                    file_data, stats, out_filename, mime_type = generate_report_based_on_toggle(
-                        v1_segs, v2_segs, filter_map[filter_opt], export_format, mode, v1_file, v2_file
-                    )
-                    
-                    st.success("Comparison Complete!")
-                    st.download_button(label=f"⬇️ DOWNLOAD REPORT ({out_filename})", data=file_data, file_name=out_filename, mime=mime_type)
-                    
-                    st.divider()
-                    st.subheader("📊 Translation Analytics")
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("Total Strings", stats["total"], help="Total count of segments found.")
-                    m2.metric("Changed Strings", f"{stats['changed']} ({stats['pct']:.1f}%)", help="Number of segments with changes.")
-                    m3.metric("Corpus TER", f"{stats['corpus_ter']:.1f}%", help="Translation Edit Rate (Total Word Edits / Total Original Words). Lower is better.")
-                    m4.metric("Avg Edit Similarity", f"{stats['avg_score']:.1f}%", help="Character-level Levenshtein ratio on changed segments. Higher is better.")
-                    m5.metric("Expansion Factor", f"{stats['expansion']:+.1f}%", help="Length difference.")
-                    st.divider()
-                    
-                except Exception as e:
-                    st.error(f"Error: {e}")
+            results_storage = []
+            taken_names = set()
+            for o_file, u_file, name_score in sorted(pairs, key=lambda p: (p[0].lang, p[0].display_name)):
+                with st.spinner(f"Processing {o_file.display_name}..."):
+                    try:
+                        v1_segs = load_segments(o_file, True)
+                        v2_segs = load_segments(u_file, False)
+                        file_data, stats, out_filename, mime_type = generate_report_based_on_toggle(
+                            v1_segs, v2_segs, filter_map[filter_opt], export_format, mode, o_file, u_file
+                        )
+                        results_storage.append({
+                            "filename": make_unique_filename(out_filename, taken_names),
+                            "lang": o_file.lang,
+                            "original_name": o_file.display_name,
+                            "updated_name": u_file.display_name,
+                            "seg_counts": (len(v1_segs), len(v2_segs)),
+                            "data": file_data,
+                            "mime": mime_type,
+                            "stats": stats
+                        })
+                    except Exception as e:
+                        st.error(f"Error processing {o_file.display_name} / {u_file.display_name}: {e}")
+            st.session_state['bilingual_results'] = results_storage
+            st.session_state['bilingual_sig'] = current_sig
+
+    results = st.session_state.get('bilingual_results')
+    if results:
+        st.success(f"Comparison Complete! Processed {len(results)} file pair(s).")
+
+        for res in results:
+            n1, n2 = res['seg_counts']
+            if n1 != n2:
+                st.warning(f"Segment count mismatch in {res['original_name']} ({n1}) vs {res['updated_name']} ({n2}). "
+                           "Segments are compared by position, so results may be misaligned.")
+
+        if len(results) > 1:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for res in results:
+                    zf.writestr(f"{res['lang']}/{res['filename']}", res['data'] if isinstance(res['data'], bytes) else res['data'].encode('utf-8'))
+            st.download_button(label="📦 DOWNLOAD ALL REPORTS (.ZIP)", data=zip_buffer.getvalue(),
+                               file_name="BilingualDiff_All_Reports.zip", mime="application/zip", key="bi_download_zip")
+
+            st.divider()
+            st.subheader("📊 Batch Summary")
+            st.dataframe(pd.DataFrame([{
+                "Target Lang": r['lang'],
+                "Original File": r['original_name'],
+                "Updated File": r['updated_name'],
+                "Total Strings": r['stats']['total'],
+                "Changed": f"{r['stats']['changed']} ({r['stats']['pct']:.1f}%)",
+                "Corpus TER %": round(r['stats']['corpus_ter'], 1),
+                "Avg Sim %": round(r['stats']['avg_score'], 1),
+                "Expansion %": round(r['stats']['expansion'], 1),
+            } for r in results]), use_container_width=True)
+            st.divider()
+
+            for i, res in enumerate(results):
+                st.write(f"**{res['original_name']}** ↔ **{res['updated_name']}**")
+                st.download_button(label=f"⬇️ DOWNLOAD REPORT ({res['filename']})", data=res['data'],
+                                   file_name=res['filename'], mime=res['mime'], key=f"bi_dl_btn_{i}")
+                st.markdown("---")
+        else:
+            res = results[0]
+            stats = res['stats']
+            st.download_button(label=f"⬇️ DOWNLOAD REPORT ({res['filename']})", data=res['data'],
+                               file_name=res['filename'], mime=res['mime'], key="bi_dl_single")
+
+            st.divider()
+            st.subheader("📊 Translation Analytics")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Total Strings", stats["total"], help="Total count of segments found.")
+            m2.metric("Changed Strings", f"{stats['changed']} ({stats['pct']:.1f}%)", help="Number of segments with changes.")
+            m3.metric("Corpus TER", f"{stats['corpus_ter']:.1f}%", help="Translation Edit Rate (Total Word Edits / Total Original Words). Lower is better.")
+            m4.metric("Avg Edit Similarity", f"{stats['avg_score']:.1f}%", help="Character-level Levenshtein ratio on changed segments. Higher is better.")
+            m5.metric("Expansion Factor", f"{stats['expansion']:+.1f}%", help="Length difference.")
+            st.divider()
 
 # 2. EXCEL MULTI-FILE MODE 
 elif mode == "Excel (3 Columns)":
