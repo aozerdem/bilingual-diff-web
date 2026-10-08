@@ -182,20 +182,32 @@ def detect_target_language(data, path=""):
         return m.group(1).lower().replace("_", "-")
     return "unknown"
 
+# Zip-based containers: plain zips and Trados project/return packages
+ARCHIVE_EXTS = (".zip", ".sdlppx", ".sdlrpx")
+
+def extract_bilingual_from_archive(data, archive_name, files, skipped, depth=0):
+    """Collects bilingual files from a zip-based archive, including archives nested inside it."""
+    if not zipfile.is_zipfile(io.BytesIO(data)):
+        skipped.append(f"{archive_name} (not a zip archive)")
+        return
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for info in zf.infolist():
+            if info.is_dir() or "__MACOSX" in info.filename: continue
+            full_name = f"{archive_name}/{info.filename}"
+            lower = info.filename.lower()
+            if lower.endswith(BILINGUAL_EXTS):
+                files.append(BilingualFile(zf.read(info), os.path.basename(info.filename), full_name))
+            elif lower.endswith(ARCHIVE_EXTS) and depth < 3:
+                extract_bilingual_from_archive(zf.read(info), full_name, files, skipped, depth + 1)
+            else:
+                skipped.append(full_name)
+
 def collect_bilingual_files(uploaded_files):
-    """Expands zip uploads and keeps only bilingual files. Returns (files, skipped_names)."""
+    """Expands archive uploads and keeps only bilingual files. Returns (files, skipped_names)."""
     files, skipped = [], []
     for up in uploaded_files or []:
-        if up.name.lower().endswith(".zip"):
-            up.seek(0)
-            with zipfile.ZipFile(up) as zf:
-                for info in zf.infolist():
-                    if info.is_dir() or "__MACOSX" in info.filename: continue
-                    full_name = f"{up.name}/{info.filename}"
-                    if info.filename.lower().endswith(BILINGUAL_EXTS):
-                        files.append(BilingualFile(zf.read(info), os.path.basename(info.filename), full_name))
-                    else:
-                        skipped.append(full_name)
+        if up.name.lower().endswith(ARCHIVE_EXTS):
+            extract_bilingual_from_archive(up.getvalue(), up.name, files, skipped)
         elif up.name.lower().endswith(BILINGUAL_EXTS):
             files.append(BilingualFile(up.getvalue(), up.name, up.name))
         else:
@@ -689,10 +701,10 @@ if mode == "Bilingual Files (TMX/XLIFF)":
     if 'excel_results' in st.session_state: del st.session_state['excel_results']
     
     col1, col2 = st.columns(2)
-    upload_types = ["tmx", "mxliff", "sdlxliff", "xlf", "xliff", "zip"]
+    upload_types = ["tmx", "mxliff", "sdlxliff", "xlf", "xliff", "zip", "sdlppx", "sdlrpx"]
     v1_uploads = col1.file_uploader("Upload Original Version(s)", type=upload_types, accept_multiple_files=True)
     v2_uploads = col2.file_uploader("Upload Updated Version(s)", type=upload_types, accept_multiple_files=True)
-    st.caption("Zip files are searched for bilingual files (TMX/XLIFF/MXLIFF/SDLXLIFF); other files are skipped. "
+    st.caption("Zip files and Trados packages (SDLPPX/SDLRPX) are searched for bilingual files (TMX/XLIFF/MXLIFF/SDLXLIFF); other files are skipped. "
                "Files are only paired with files of the same target language.")
     match_threshold = st.slider("File Name Match Threshold (%)", 50, 100, 90,
                                 help="Original and updated files are paired by file name similarity. Pairs below this score are left unmatched.")
