@@ -7,6 +7,7 @@ import html
 import re
 from difflib import ndiff, SequenceMatcher
 from collections import Counter
+from itertools import groupby
 import io
 import os
 import zipfile
@@ -287,320 +288,253 @@ def calculate_word_edits(original: str, edited: str) -> int:
             )
     return matrix[n][m]
 
-def generate_html_report(v1_segs, v2_segs, filter_option):
-    filtered = []
-    
-    total_strings = len(v1_segs)
-    changed_strings = 0
-    removed_words_counter = Counter()
-    added_words_counter = Counter()
-    
-    edit_distances = [] 
-    total_len_v1 = 0
-    total_len_v2 = 0
-    
-    # TER Trackers
-    corpus_word_edits = 0
-    corpus_ref_words = 0
-    
+ATTRIBUTION = "BilingualDiff v.1.2 - Developed by Ahmet Ozerdem"
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+def empty_totals():
+    return {"total": 0, "changed": 0, "len_v1": 0, "len_v2": 0, "word_edits": 0, "ref_words": 0,
+            "changed_scores": [], "removed": Counter(), "added": Counter()}
+
+def compare_segments(v1_segs, v2_segs):
+    """Compares segments by position. Returns (rows, totals); totals are raw sums so comparisons can be merged."""
+    rows = []
+    totals = empty_totals()
+    totals["total"] = len(v1_segs)
+
     for i, (seg1, seg2) in enumerate(zip(v1_segs, v2_segs), 1):
         source = seg1.get("source", "")
         v1 = seg1.get("target", "")
         v2 = seg2.get("target", "")
-        
-        total_len_v1 += len(v1)
-        total_len_v2 += len(v2)
-        
+
+        totals["len_v1"] += len(v1)
+        totals["len_v2"] += len(v2)
+
         # Track words for Global TER using standard normalization token count
-        v1_tokens = tokenize_for_ter(v1)
-        v1_word_count = len(v1_tokens)
-        corpus_ref_words += v1_word_count
+        v1_word_count = len(tokenize_for_ter(v1))
+        totals["ref_words"] += v1_word_count
 
         status = "Same"
-        score = 100 
+        score = 100
         ter_score = 0.0
 
         if v1 != v2:
             status = "Different"
-            changed_strings += 1
-            
+            totals["changed"] += 1
+
             # Similarity
-            matcher = SequenceMatcher(None, v1, v2)
-            score = round(matcher.ratio() * 100, 1)
-            edit_distances.append(score)
-            
+            score = round(SequenceMatcher(None, v1, v2).ratio() * 100, 1)
+            if score < 100: totals["changed_scores"].append(score)
+
             # Normalized TER Calculation
             edits = calculate_word_edits(v1, v2)
-            corpus_word_edits += edits
+            totals["word_edits"] += edits
             if v1_word_count > 0:
                 ter_score = round((edits / v1_word_count) * 100, 1)
             else:
                 ter_score = 100.0 if len(tokenize_for_ter(v2)) > 0 else 0.0
-            
+
             # Words
             w1 = Counter(get_valid_words(v1))
             w2 = Counter(get_valid_words(v2))
-            removed = (w1 - w2).elements()
-            removed_words_counter.update(removed)
-            added = (w2 - w1).elements()
-            added_words_counter.update(added)
-        else:
-             edit_distances.append(100)
+            totals["removed"].update((w1 - w2).elements())
+            totals["added"].update((w2 - w1).elements())
 
-        if filter_option == "diff" and status == "Same": continue
-        if filter_option == "same" and status == "Different": continue
+        rows.append((i, source, v1, v2, status, score, ter_score))
 
-        v1_hl, v2_hl = highlight_differences(v1, v2)
-        filtered.append((i, source, v1_hl, v2_hl, status, score, ter_score))
+    return rows, totals
 
-    change_pct = (changed_strings / total_strings * 100) if total_strings > 0 else 0
-    top5_removed = removed_words_counter.most_common(5)
-    top5_added = added_words_counter.most_common(5)
-    expansion = ((total_len_v2 - total_len_v1) / total_len_v1 * 100) if total_len_v1 > 0 else 0
-    
-    changed_scores = [s for s in edit_distances if s < 100]
-    avg_edit_score = sum(changed_scores) / len(changed_scores) if changed_scores else 100
-    
-    # Calculate Global Corpus TER
-    global_ter = (corpus_word_edits / corpus_ref_words * 100) if corpus_ref_words > 0 else 0
+def merge_totals(totals_list):
+    merged = empty_totals()
+    for totals in totals_list:
+        for key, value in totals.items():
+            merged[key] += value
+    return merged
 
+def summarize_totals(totals):
+    """Turns raw totals into the report statistics."""
+    changed_scores = totals["changed_scores"]
     edit_categories = {"Minor Edit (>85%)": 0, "Medium Edit (50-85%)": 0, "Major Rewrite (<50%)": 0}
     for s in changed_scores:
         if s > 85: edit_categories["Minor Edit (>85%)"] += 1
         elif s >= 50: edit_categories["Medium Edit (50-85%)"] += 1
         else: edit_categories["Major Rewrite (<50%)"] += 1
 
-    def list_to_html(lst):
-        return ", ".join([f"{w} ({c})" for w, c in lst]) if lst else "None"
+    total, changed, len_v1 = totals["total"], totals["changed"], totals["len_v1"]
+    return {
+        "total": total,
+        "changed": changed,
+        "pct": (changed / total * 100) if total > 0 else 0,
+        "expansion": ((totals["len_v2"] - len_v1) / len_v1 * 100) if len_v1 > 0 else 0,
+        "avg_score": sum(changed_scores) / len(changed_scores) if changed_scores else 100,
+        "corpus_ter": (totals["word_edits"] / totals["ref_words"] * 100) if totals["ref_words"] > 0 else 0,
+        "top_removed": totals["removed"].most_common(5),
+        "top_added": totals["added"].most_common(5),
+        "graph_data": edit_categories
+    }
 
-    html_out = f"""
-    <html><head><meta charset="UTF-8"><title>BilingualDiff Report</title>
+def filter_rows(rows, filter_option):
+    if filter_option == "diff": return [r for r in rows if r[4] == "Different"]
+    if filter_option == "same": return [r for r in rows if r[4] == "Same"]
+    return rows
+
+def format_top_words(lst):
+    return ", ".join([f"{w} ({c})" for w, c in lst]) if lst else "None"
+
+def html_page(title, body):
+    return f"""
+    <html><head><meta charset="UTF-8"><title>{title}</title>
     <style>
-        body {{ font-family: Segoe UI, sans-serif; padding: 20px; color: #333; }} 
-        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 14px; }} 
-        th, td {{ border: 1px solid #ddd; padding: 8px; vertical-align: top; }} 
-        th {{ background-color: #f2f2f2; text-align: left; }} 
-        .diff {{ background-color: #fff9db; }} 
+        body {{ font-family: Segoe UI, sans-serif; padding: 20px; color: #333; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 14px; }}
+        th, td {{ border: 1px solid #ddd; padding: 8px; vertical-align: top; }}
+        th {{ background-color: #f2f2f2; text-align: left; }}
+        .diff {{ background-color: #fff9db; }}
         .stats-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 20px; }}
         .stat-card {{ background: #f8f9fa; padding: 15px; border: 1px solid #ddd; border-radius: 8px; }}
         .stat-val {{ font-size: 1.2em; font-weight: bold; }}
         .stat-label {{ font-size: 0.9em; color: #666; }}
         .attribution {{ font-size: 0.8em; color: #888; text-align: right; margin-bottom: 4px; }}
+        tr.subtotal td {{ font-weight: bold; background-color: #f2f2f2; }}
+        tr.total td {{ font-weight: bold; background-color: #e0e0e0; }}
+        h3 {{ margin-top: 40px; padding-top: 20px; border-top: 2px solid #ddd; }}
     </style>
     </head><body>
-    <div class="attribution">BilingualDiff v.1.2 - Developed by Ahmet Ozerdem</div>
-    <h2>Comparison Report</h2>
-    
-    <div class="stats-grid">
-        <div class="stat-card"><div class="stat-val">{total_strings}</div><div class="stat-label">Total Strings</div></div>
-        <div class="stat-card"><div class="stat-val">{changed_strings} ({change_pct:.1f}%)</div><div class="stat-label">Changed Strings</div></div>
-        <div class="stat-card"><div class="stat-val">{global_ter:.1f}%</div><div class="stat-label">Corpus TER</div></div>
-        <div class="stat-card"><div class="stat-val">{avg_edit_score:.1f}%</div><div class="stat-label">Avg Similarity (on edits)</div></div>
-        <div class="stat-card"><div class="stat-val">{expansion:+.1f}%</div><div class="stat-label">Expansion Factor</div></div>
-    </div>
-    
-    <p><b>Top Removed:</b> {list_to_html(top5_removed)}<br>
-    <b>Top Added:</b> {list_to_html(top5_added)}</p>
+    <div class="attribution">{ATTRIBUTION}</div>
+    {body}
+    </body></html>"""
 
+def render_html_stats(stats):
+    return f"""
+    <div class="stats-grid">
+        <div class="stat-card"><div class="stat-val">{stats['total']}</div><div class="stat-label">Total Strings</div></div>
+        <div class="stat-card"><div class="stat-val">{stats['changed']} ({stats['pct']:.1f}%)</div><div class="stat-label">Changed Strings</div></div>
+        <div class="stat-card"><div class="stat-val">{stats['corpus_ter']:.1f}%</div><div class="stat-label">Corpus TER</div></div>
+        <div class="stat-card"><div class="stat-val">{stats['avg_score']:.1f}%</div><div class="stat-label">Avg Similarity (on edits)</div></div>
+        <div class="stat-card"><div class="stat-val">{stats['expansion']:+.1f}%</div><div class="stat-label">Expansion Factor</div></div>
+    </div>
+
+    <p><b>Top Removed:</b> {format_top_words(stats['top_removed'])}<br>
+    <b>Top Added:</b> {format_top_words(stats['top_added'])}</p>
+    """
+
+def render_html_table(rows, filter_option):
+    html_out = """
     <table>
     <tr><th>ID</th><th>Source</th><th>Original Version</th><th>Updated Version</th><th>Sim %</th><th>TER %</th></tr>
     """
-    
-    for seg_id, src, v1, v2, status, score, ter_score in filtered:
+    for seg_id, src, v1, v2, status, score, ter_score in filter_rows(rows, filter_option):
+        v1_hl, v2_hl = highlight_differences(v1, v2)
         row_class = "diff" if status == "Different" else ""
         ter_str = f"{ter_score:.1f}%" if status == "Different" else "-"
-        html_out += f'<tr class="{row_class}"><td>{seg_id}</td><td>{src}</td><td>{v1}</td><td>{v2}</td><td>{score}%</td><td>{ter_str}</td></tr>'
-    
-    html_out += "</table></body></html>"
-    
-    stats = {
-        "total": total_strings,
-        "changed": changed_strings,
-        "pct": change_pct,
-        "expansion": expansion,
-        "avg_score": avg_edit_score,
-        "corpus_ter": global_ter,
-        "top_removed": top5_removed,
-        "top_added": top5_added,
-        "graph_data": edit_categories
+        html_out += f'<tr class="{row_class}"><td>{seg_id}</td><td>{src}</td><td>{v1_hl}</td><td>{v2_hl}</td><td>{score}%</td><td>{ter_str}</td></tr>'
+    return html_out + "</table>"
+
+def generate_html_report(rows, stats, filter_option):
+    body = "<h2>Comparison Report</h2>" + render_html_stats(stats) + render_html_table(rows, filter_option)
+    return html_page("BilingualDiff Report", body)
+
+def add_report_formats(workbook):
+    return {
+        'header': workbook.add_format({'bold': True, 'bg_color': '#f2f2f2', 'border': 1}),
+        'cell': workbook.add_format({'border': 1, 'text_wrap': True, 'valign': 'top'}),
+        'diff_bg': workbook.add_format({'bg_color': '#fff9db', 'border': 1, 'text_wrap': True, 'valign': 'top'}),
+        'red': workbook.add_format({'font_color': '#9c0006', 'bg_color': '#ffdce0', 'font_strikeout': True}),
+        'green': workbook.add_format({'font_color': '#006100', 'bg_color': '#e2ffdc'}),
+        'default': workbook.add_format({'font_color': '#000000'}),
+        'title': workbook.add_format({'bold': True, 'font_size': 16}),
+        'subtitle': workbook.add_format({'italic': True, 'font_color': '#555555'}),
+        'attr': workbook.add_format({'italic': True, 'font_color': '#888888', 'align': 'right'}),
+        'stat_lbl': workbook.add_format({'font_color': '#666666'}),
+        'stat_val': workbook.add_format({'bold': True, 'font_size': 14}),
+        'top_words': workbook.add_format({'text_wrap': True, 'valign': 'top'}),
+        'link': workbook.add_format({'font_color': 'blue', 'underline': 1}),
     }
-    
-    return html_out, stats
 
-def generate_excel_report(v1_segs, v2_segs, filter_option):
-    output = io.BytesIO()
-    workbook = xlsxwriter.Workbook(output, {'in_memory': True})
-    worksheet = workbook.add_worksheet('Comparison Report')
-    
-    # --- Formats ---
-    header_fmt = workbook.add_format({'bold': True, 'bg_color': '#f2f2f2', 'border': 1})
-    cell_fmt = workbook.add_format({'border': 1, 'text_wrap': True, 'valign': 'top'})
-    diff_bg_fmt = workbook.add_format({'bg_color': '#fff9db', 'border': 1, 'text_wrap': True, 'valign': 'top'})
-    
-    red_fmt = workbook.add_format({'font_color': '#9c0006', 'bg_color': '#ffdce0', 'font_strikeout': True})
-    green_fmt = workbook.add_format({'font_color': '#006100', 'bg_color': '#e2ffdc'})
-    default_fmt = workbook.add_format({'font_color': '#000000'})
+def optimize_chunks(chunks):
+    """Joins neighbouring [format, text] chunks that share a format."""
+    opt = []
+    curr_fmt, curr_str = None, ""
+    for j in range(0, len(chunks), 2):
+        fmt, text = chunks[j], chunks[j+1]
+        if fmt == curr_fmt: curr_str += text
+        else:
+            if curr_str: opt.extend([curr_fmt, curr_str])
+            curr_fmt, curr_str = fmt, text
+    if curr_str: opt.extend([curr_fmt, curr_str])
+    return opt
 
-    title_fmt = workbook.add_format({'bold': True, 'font_size': 16})
-    attr_fmt = workbook.add_format({'italic': True, 'font_color': '#888888', 'align': 'right'})
-    stat_lbl_fmt = workbook.add_format({'font_color': '#666666'})
-    stat_val_fmt = workbook.add_format({'bold': True, 'font_size': 14})
-    top_words_fmt = workbook.add_format({'text_wrap': True, 'valign': 'top'})
+REPORT_TABLE_START_ROW = 8
 
-    TABLE_START_ROW = 8
-    
+def write_dashboard(worksheet, fmt, stats, title, last_col):
+    """Writes the title and statistics block (rows 0-6) at the top of a report sheet."""
+    worksheet.write(0, 0, title, fmt['title'])
+    worksheet.merge_range(0, last_col - 1, 0, last_col, ATTRIBUTION, fmt['attr'])
+
+    labels = ["Total Strings", "Changed Strings", "Corpus TER", "Avg Sim (on edits)", "Expansion Factor"]
+    values = [stats['total'], f"{stats['changed']} ({stats['pct']:.1f}%)", f"{stats['corpus_ter']:.1f}%",
+              f"{stats['avg_score']:.1f}%", f"{stats['expansion']:+.1f}%"]
+    for col, (label, value) in enumerate(zip(labels, values)):
+        worksheet.write(2, col, label, fmt['stat_lbl'])
+        worksheet.write(3, col, value, fmt['stat_val'])
+
+    worksheet.merge_range(5, 0, 5, last_col, f"Top Removed: {format_top_words(stats['top_removed'])}", fmt['top_words'])
+    worksheet.merge_range(6, 0, 6, last_col, f"Top Added: {format_top_words(stats['top_added'])}", fmt['top_words'])
+
+def write_comparison_sheet(worksheet, fmt, rows, stats, filter_option):
+    """Writes one comparison (dashboard + colour-coded segment table) to a worksheet. Row 1 is left free for a subtitle."""
+    write_dashboard(worksheet, fmt, stats, "Comparison Report", last_col=5)
+
     headers = ['ID', 'Source', 'Original Version', 'Updated Version', 'Sim %', 'TER %']
     for col_num, header in enumerate(headers):
-        worksheet.write(TABLE_START_ROW, col_num, header, header_fmt)
-        
+        worksheet.write(REPORT_TABLE_START_ROW, col_num, header, fmt['header'])
+
     worksheet.set_column('A:A', 6)
     worksheet.set_column('B:D', 45)
     worksheet.set_column('E:F', 10)
 
-    total_strings = len(v1_segs)
-    changed_strings = 0
-    removed_words_counter = Counter()
-    added_words_counter = Counter()
-    edit_distances = [] 
-    total_len_v1, total_len_v2 = 0, 0
-    corpus_word_edits, corpus_ref_words = 0, 0
-    
-    row_idx = TABLE_START_ROW + 1
-    
-    for i, (seg1, seg2) in enumerate(zip(v1_segs, v2_segs), 1):
-        source = seg1.get("source", "")
-        v1 = seg1.get("target", "")
-        v2 = seg2.get("target", "")
-        
-        total_len_v1 += len(v1)
-        total_len_v2 += len(v2)
-        v1_tokens = tokenize_for_ter(v1)
-        v1_word_count = len(v1_tokens)
-        corpus_ref_words += v1_word_count
+    row_idx = REPORT_TABLE_START_ROW + 1
 
-        status = "Same"
-        score = 100 
-        ter_score = 0.0
+    for i, source, v1, v2, status, score, ter_score in filter_rows(rows, filter_option):
+        current_fmt = fmt['diff_bg'] if status == "Different" else fmt['cell']
 
-        if v1 != v2:
-            status = "Different"
-            changed_strings += 1
-            
-            score = round(SequenceMatcher(None, v1, v2).ratio() * 100, 1)
-            edit_distances.append(score)
-            
-            edits = calculate_word_edits(v1, v2)
-            corpus_word_edits += edits
-            if v1_word_count > 0: ter_score = round((edits / v1_word_count) * 100, 1)
-            else: ter_score = 100.0 if len(tokenize_for_ter(v2)) > 0 else 0.0
-            
-            w1, w2 = Counter(get_valid_words(v1)), Counter(get_valid_words(v2))
-            removed_words_counter.update((w1 - w2).elements())
-            added_words_counter.update((w2 - w1).elements())
-        else:
-             edit_distances.append(100)
-
-        if filter_option == "diff" and status == "Same": continue
-        if filter_option == "same" and status == "Different": continue
-
-        current_fmt = diff_bg_fmt if status == "Different" else cell_fmt
-        
         worksheet.write(row_idx, 0, i, current_fmt)
         worksheet.write(row_idx, 1, source, current_fmt)
         worksheet.write(row_idx, 4, f"{score}%", current_fmt)
         worksheet.write(row_idx, 5, f"{ter_score:.1f}%" if status == "Different" else "-", current_fmt)
 
         if status == "Different":
-            diff = list(ndiff(v1, v2))
             v1_chunks, v2_chunks = [], []
-            
-            for d in diff:
+
+            for d in ndiff(v1, v2):
                 code, char = d[0], d[2:]
                 if code == ' ':
-                    v1_chunks.extend([default_fmt, char])
-                    v2_chunks.extend([default_fmt, char])
+                    v1_chunks.extend([fmt['default'], char])
+                    v2_chunks.extend([fmt['default'], char])
                 elif code == '-':
-                    v1_chunks.extend([red_fmt, char])
+                    v1_chunks.extend([fmt['red'], char])
                 elif code == '+':
-                    v2_chunks.extend([green_fmt, char])
-                    
-            def optimize_chunks(chunks):
-                opt = []
-                curr_fmt, curr_str = None, ""
-                for j in range(0, len(chunks), 2):
-                    fmt, text = chunks[j], chunks[j+1]
-                    if fmt == curr_fmt: curr_str += text
-                    else:
-                        if curr_str: opt.extend([curr_fmt, curr_str])
-                        curr_fmt, curr_str = fmt, text
-                if curr_str: opt.extend([curr_fmt, curr_str])
-                return opt
-            
+                    v2_chunks.extend([fmt['green'], char])
+
             v1_opt = optimize_chunks(v1_chunks)
             v2_opt = optimize_chunks(v2_chunks)
-            
+
             if len(v1_opt) > 2: worksheet.write_rich_string(row_idx, 2, *v1_opt, current_fmt)
             else: worksheet.write(row_idx, 2, v1_opt[1] if len(v1_opt)==2 else v1, current_fmt)
-            
+
             if len(v2_opt) > 2: worksheet.write_rich_string(row_idx, 3, *v2_opt, current_fmt)
             else: worksheet.write(row_idx, 3, v2_opt[1] if len(v2_opt)==2 else v2, current_fmt)
         else:
             worksheet.write(row_idx, 2, v1, current_fmt)
             worksheet.write(row_idx, 3, v2, current_fmt)
-        
+
         row_idx += 1
 
-    # --- Calculations ---
-    change_pct = (changed_strings / total_strings * 100) if total_strings > 0 else 0
-    expansion = ((total_len_v2 - total_len_v1) / total_len_v1 * 100) if total_len_v1 > 0 else 0
-    changed_scores = [s for s in edit_distances if s < 100]
-    avg_edit_score = sum(changed_scores) / len(changed_scores) if changed_scores else 100
-    global_ter = (corpus_word_edits / corpus_ref_words * 100) if corpus_ref_words > 0 else 0
-
-    top5_removed = removed_words_counter.most_common(5)
-    top5_added = added_words_counter.most_common(5)
-
-    def list_to_str(lst):
-        return ", ".join([f"{w} ({c})" for w, c in lst]) if lst else "None"
-
-    # --- WRITE DASHBOARD TO TOP OF EXCEL ---
-    worksheet.write(0, 0, "Comparison Report", title_fmt)
-    worksheet.merge_range(0, 4, 0, 5, "BilingualDiff v.1.2 - Developed by Ahmet Ozerdem", attr_fmt)
-
-    # Labels
-    worksheet.write(2, 0, "Total Strings", stat_lbl_fmt)
-    worksheet.write(2, 1, "Changed Strings", stat_lbl_fmt)
-    worksheet.write(2, 2, "Corpus TER", stat_lbl_fmt)
-    worksheet.write(2, 3, "Avg Sim (on edits)", stat_lbl_fmt)
-    worksheet.write(2, 4, "Expansion Factor", stat_lbl_fmt)
-
-    # Values
-    worksheet.write(3, 0, total_strings, stat_val_fmt)
-    worksheet.write(3, 1, f"{changed_strings} ({change_pct:.1f}%)", stat_val_fmt)
-    worksheet.write(3, 2, f"{global_ter:.1f}%", stat_val_fmt)
-    worksheet.write(3, 3, f"{avg_edit_score:.1f}%", stat_val_fmt)
-    worksheet.write(3, 4, f"{expansion:+.1f}%", stat_val_fmt)
-
-    # Top Words
-    worksheet.merge_range(5, 0, 5, 5, f"Top Removed: {list_to_str(top5_removed)}", top_words_fmt)
-    worksheet.merge_range(6, 0, 6, 5, f"Top Added: {list_to_str(top5_added)}", top_words_fmt)
-
+def generate_excel_report(rows, stats, filter_option):
+    output = io.BytesIO()
+    workbook = xlsxwriter.Workbook(output, {'in_memory': True})
+    write_comparison_sheet(workbook.add_worksheet('Comparison Report'), add_report_formats(workbook), rows, stats, filter_option)
     workbook.close()
-    
-    # Analytics for UI Graph
-    edit_categories = {"Minor Edit (>85%)": 0, "Medium Edit (50-85%)": 0, "Major Rewrite (<50%)": 0}
-    for s in changed_scores:
-        if s > 85: edit_categories["Minor Edit (>85%)"] += 1
-        elif s >= 50: edit_categories["Medium Edit (50-85%)"] += 1
-        else: edit_categories["Major Rewrite (<50%)"] += 1
-
-    stats = {
-        "total": total_strings, "changed": changed_strings, "pct": change_pct,
-        "expansion": expansion, "avg_score": avg_edit_score, "corpus_ter": global_ter,
-        "top_removed": top5_removed, "top_added": top5_added, 
-        "graph_data": edit_categories
-    }
-    return output.getvalue(), stats
+    return output.getvalue()
 
 def name_similarity(f1, f2):
     """(file name score, full path score) - the path score only breaks ties between identical names."""
@@ -644,16 +578,130 @@ def make_unique_filename(filename, taken):
     taken.add(candidate)
     return candidate
 
-def generate_report_based_on_toggle(v1_segs, v2_segs, filter_val, export_fmt, mode, f1, f2=None):
+def generate_report_based_on_toggle(comparison, filter_val, export_fmt, mode, f1, f2=None):
+    """comparison: (rows, totals) from compare_segments."""
+    rows, totals = comparison
+    stats = summarize_totals(totals)
     if export_fmt == "HTML Report":
-        data, stats = generate_html_report(v1_segs, v2_segs, filter_val)
+        data = generate_html_report(rows, stats, filter_val)
         filename = generate_output_filename(mode, f1, f2)
         mime = "text/html"
     else:
-        data, stats = generate_excel_report(v1_segs, v2_segs, filter_val)
+        data = generate_excel_report(rows, stats, filter_val)
         filename = generate_output_filename(mode, f1, f2).replace(".html", ".xlsx")
-        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime = XLSX_MIME
     return data, stats, filename, mime
+
+# --- Consolidated report (several file pairs in one file) ---
+# items: one dict per pair with lang, original_name, updated_name, rows, totals and stats, sorted by lang.
+
+def pair_count(n):
+    return f"{n} pair" if n == 1 else f"{n} pairs"
+
+def consolidated_summary(items):
+    """Summary lines: each pair, a subtotal after each language (when there are several), then the grand total."""
+    groups = [(lang, list(group)) for lang, group in groupby(enumerate(items, 1), key=lambda e: e[1]['lang'])]
+    lines = []
+    for lang, group in groups:
+        for n, item in group:
+            lines.append({"kind": "pair", "n": n, "lang": lang, "original": item['original_name'],
+                          "updated": item['updated_name'], "stats": item['stats']})
+        if len(groups) > 1:
+            lines.append({"kind": "subtotal", "lang": lang, "original": f"Subtotal ({pair_count(len(group))})", "updated": "",
+                          "stats": summarize_totals(merge_totals(item['totals'] for _, item in group))})
+    lines.append({"kind": "total", "lang": "", "original": f"Grand Total ({pair_count(len(items))})", "updated": "",
+                  "stats": summarize_totals(merge_totals(item['totals'] for item in items))})
+    return lines
+
+def consolidated_caption(items):
+    langs = len({item['lang'] for item in items})
+    return f"{pair_count(len(items))} across {langs} target language{'' if langs == 1 else 's'}"
+
+def generate_consolidated_html(items, filter_option):
+    lines = consolidated_summary(items)
+    parts = [f"<h2>Consolidated Report</h2><p>{consolidated_caption(items)}</p>",
+             render_html_stats(lines[-1]['stats']),
+             "<table><tr><th>Target Lang</th><th>Original File</th><th>Updated File</th><th>Total Strings</th><th>Changed</th>"
+             "<th>Changed %</th><th>Corpus TER %</th><th>Avg Sim %</th><th>Expansion %</th></tr>"]
+    for line in lines:
+        s = line['stats']
+        original = html.escape(line['original'])
+        if line['kind'] == "pair":
+            original = f'<a href="#pair-{line["n"]}">{original}</a>'
+        parts.append(f'<tr class="{line["kind"]}"><td>{html.escape(line["lang"])}</td><td>{original}</td><td>{html.escape(line["updated"])}</td>'
+                     f'<td>{s["total"]}</td><td>{s["changed"]}</td><td>{s["pct"]:.1f}%</td><td>{s["corpus_ter"]:.1f}%</td>'
+                     f'<td>{s["avg_score"]:.1f}%</td><td>{s["expansion"]:+.1f}%</td></tr>')
+    parts.append("</table>")
+
+    for n, item in enumerate(items, 1):
+        parts.append(f'<h3 id="pair-{n}">{n}. [{html.escape(item["lang"])}] {html.escape(item["original_name"])} ↔ {html.escape(item["updated_name"])}</h3>'
+                     '<p><a href="#top">↑ Back to summary</a></p>')
+        parts.append(render_html_stats(item['stats']))
+        parts.append(render_html_table(item['rows'], filter_option))
+    return html_page("BilingualDiff Consolidated Report", "".join(parts))
+
+def add_summary_formats(workbook):
+    """Summary table formats per line kind (pair / subtotal / total) and cell type."""
+    line_styles = {"pair": {}, "subtotal": {'bold': True, 'bg_color': '#f2f2f2'}, "total": {'bold': True, 'bg_color': '#d9d9d9'}}
+    cell_styles = {"text": {'text_wrap': True}, "int": {}, "pct": {'num_format': '0.0%'},
+                   "exp": {'num_format': '+0.0%;-0.0%;0.0%'}, "link": {'font_color': 'blue', 'underline': 1}}
+    return {kind: {name: workbook.add_format({'border': 1, 'valign': 'top', **line_style, **cell_style})
+                   for name, cell_style in cell_styles.items()}
+            for kind, line_style in line_styles.items()}
+
+def excel_sheet_name(n, item):
+    """Unique sheet name for the n-th pair; Excel allows at most 31 chars and no []:*?/\\ or quotes."""
+    base = os.path.splitext(os.path.basename(item['original_name']))[0]
+    return re.sub(r"[\[\]:*?/\\']", "_", f"{n:02d}_{item['lang']}_{base}")[:31]
+
+def generate_consolidated_excel(items, filter_option):
+    output = io.BytesIO()
+    workbook = xlsxwriter.Workbook(output, {'in_memory': True})
+    fmt = add_report_formats(workbook)
+    summary_fmt = add_summary_formats(workbook)
+    sheet_names = [excel_sheet_name(n, item) for n, item in enumerate(items, 1)]
+    lines = consolidated_summary(items)
+
+    summary = workbook.add_worksheet('Summary')
+    write_dashboard(summary, fmt, lines[-1]['stats'], "Consolidated Report", last_col=9)
+    summary.write(1, 0, consolidated_caption(items), fmt['subtitle'])
+
+    headers = ['Target Lang', 'Original File', 'Updated File', 'Total Strings', 'Changed', 'Changed %',
+               'Corpus TER %', 'Avg Sim %', 'Expansion %', 'Sheet']
+    for col, header in enumerate(headers):
+        summary.write(REPORT_TABLE_START_ROW, col, header, fmt['header'])
+    summary.set_column('A:A', 14)
+    summary.set_column('B:C', 40)
+    summary.set_column('D:I', 18)
+    summary.set_column('J:J', 34)
+
+    for row, line in enumerate(lines, REPORT_TABLE_START_ROW + 1):
+        style, s = summary_fmt[line['kind']], line['stats']
+        cells = [(line['lang'], 'text'), (line['original'], 'text'), (line['updated'], 'text'),
+                 (s['total'], 'int'), (s['changed'], 'int'), (s['pct'] / 100, 'pct'), (s['corpus_ter'] / 100, 'pct'),
+                 (s['avg_score'] / 100, 'pct'), (s['expansion'] / 100, 'exp')]
+        for col, (value, kind) in enumerate(cells):
+            summary.write(row, col, value, style[kind])
+        if line['kind'] == "pair":
+            name = sheet_names[line['n'] - 1]
+            summary.write_url(row, 9, f"internal:'{name}'!A1", style['link'], name)
+        else:
+            summary.write_blank(row, 9, None, style['text'])
+
+    for name, item in zip(sheet_names, items):
+        sheet = workbook.add_worksheet(name)
+        write_comparison_sheet(sheet, fmt, item['rows'], item['stats'], filter_option)
+        sheet.write(1, 0, f"[{item['lang']}]  {item['original_name']}  ↔  {item['updated_name']}", fmt['subtitle'])
+        sheet.write_url(1, 4, "internal:'Summary'!A1", fmt['link'], "← Back to Summary")
+
+    workbook.close()
+    return output.getvalue()
+
+def generate_consolidated_report(items, filter_val, export_fmt):
+    """One file for a batch: summary (per pair, per language, overall) followed by each pair's full comparison."""
+    if export_fmt == "HTML Report":
+        return {"filename": "BilingualDiff_Consolidated_Report.html", "data": generate_consolidated_html(items, filter_val), "mime": "text/html"}
+    return {"filename": "BilingualDiff_Consolidated_Report.xlsx", "data": generate_consolidated_excel(items, filter_val), "mime": XLSX_MIME}
 
 # ==========================================
 # PART 3: STREAMLIT UI
@@ -731,10 +779,16 @@ if mode == "Bilingual Files (TMX/XLIFF)":
     elif v1_uploads and v2_uploads:
         st.warning("No bilingual files found in the uploads.")
 
+    consolidate = len(pairs) > 1 and st.checkbox(
+        "Also create a consolidated report",
+        help="One extra file in the selected export format: a summary of all pairs (per pair, per target language and overall) "
+             "followed by the full comparison of each pair.")
+
     # Drop old results when the uploads or settings change
-    current_sig = ([f.name for f in v1_uploads or []], [f.name for f in v2_uploads or []], match_threshold, filter_opt, export_format)
+    current_sig = ([f.name for f in v1_uploads or []], [f.name for f in v2_uploads or []], match_threshold, filter_opt, export_format, consolidate)
     if st.session_state.get('bilingual_sig') != current_sig:
         st.session_state.pop('bilingual_results', None)
+        st.session_state.pop('bilingual_consolidated', None)
 
     if st.button("Compare & Generate Report"):
         if not v1_files or not v2_files:
@@ -743,16 +797,18 @@ if mode == "Bilingual Files (TMX/XLIFF)":
             st.error("No file pairs could be matched. Try lowering the match threshold.")
         else:
             results_storage = []
+            consolidated_items = []
             taken_names = set()
             for o_file, u_file, name_score in sorted(pairs, key=lambda p: (p[0].lang, p[0].display_name)):
                 with st.spinner(f"Processing {o_file.display_name}..."):
                     try:
                         v1_segs = load_segments(o_file, True)
                         v2_segs = load_segments(u_file, False)
+                        comparison = compare_segments(v1_segs, v2_segs)
                         file_data, stats, out_filename, mime_type = generate_report_based_on_toggle(
-                            v1_segs, v2_segs, filter_map[filter_opt], export_format, mode, o_file, u_file
+                            comparison, filter_map[filter_opt], export_format, mode, o_file, u_file
                         )
-                        results_storage.append({
+                        result = {
                             "filename": make_unique_filename(out_filename, taken_names),
                             "lang": o_file.lang,
                             "original_name": o_file.display_name,
@@ -761,10 +817,23 @@ if mode == "Bilingual Files (TMX/XLIFF)":
                             "data": file_data,
                             "mime": mime_type,
                             "stats": stats
-                        })
+                        }
+                        results_storage.append(result)
+                        if consolidate:
+                            rows, totals = comparison
+                            consolidated_items.append(dict(result, rows=rows, totals=totals))
                     except Exception as e:
                         st.error(f"Error processing {o_file.display_name} / {u_file.display_name}: {e}")
+
+            consolidated_report = None
+            if len(consolidated_items) > 1:
+                with st.spinner("Building consolidated report..."):
+                    try:
+                        consolidated_report = generate_consolidated_report(consolidated_items, filter_map[filter_opt], export_format)
+                    except Exception as e:
+                        st.error(f"Error building the consolidated report: {e}")
             st.session_state['bilingual_results'] = results_storage
+            st.session_state['bilingual_consolidated'] = consolidated_report
             st.session_state['bilingual_sig'] = current_sig
 
     results = st.session_state.get('bilingual_results')
@@ -778,12 +847,18 @@ if mode == "Bilingual Files (TMX/XLIFF)":
                            "Segments are compared by position, so results may be misaligned.")
 
         if len(results) > 1:
+            consolidated = st.session_state.get('bilingual_consolidated')
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                 for res in results:
                     zf.writestr(f"{res['lang']}/{res['filename']}", res['data'] if isinstance(res['data'], bytes) else res['data'].encode('utf-8'))
+                if consolidated:
+                    zf.writestr(consolidated['filename'], consolidated['data'] if isinstance(consolidated['data'], bytes) else consolidated['data'].encode('utf-8'))
             st.download_button(label="📦 DOWNLOAD ALL REPORTS (.ZIP)", data=zip_buffer.getvalue(),
                                file_name="BilingualDiff_All_Reports.zip", mime="application/zip", key="bi_download_zip")
+            if consolidated:
+                st.download_button(label=f"📑 DOWNLOAD CONSOLIDATED REPORT ({consolidated['filename']})", data=consolidated['data'],
+                                   file_name=consolidated['filename'], mime=consolidated['mime'], key="bi_download_consolidated")
 
             st.divider()
             st.subheader("📊 Batch Summary")
@@ -835,7 +910,7 @@ elif mode == "Excel (3 Columns)":
                     try:
                         v1_segs, v2_segs = parse_excel(excel_file)
                         file_data, stats, out_filename, mime_type = generate_report_based_on_toggle(
-                            v1_segs, v2_segs, filter_map[filter_opt], export_format, mode, excel_file
+                            compare_segments(v1_segs, v2_segs), filter_map[filter_opt], export_format, mode, excel_file
                         )
                         
                         results_storage.append({
@@ -902,7 +977,7 @@ elif mode == "WOL Report":
                     v1_segs = load_segments(v1_file, True)
                     v2_segs = load_segments(v1_file, False)
                     file_data, stats, out_filename, mime_type = generate_report_based_on_toggle(
-                        v1_segs, v2_segs, filter_map[filter_opt], export_format, mode, v1_file
+                        compare_segments(v1_segs, v2_segs), filter_map[filter_opt], export_format, mode, v1_file
                     )
                     st.success("Comparison Complete!")
                     st.download_button(label=f"⬇️ DOWNLOAD REPORT ({out_filename})", data=file_data, file_name=out_filename, mime=mime_type)
